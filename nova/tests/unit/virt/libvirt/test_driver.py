@@ -14789,11 +14789,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         class ImageBackend(object):
             path = '/path'
 
-            def check_image_exists(self):
-                if self.path == '/fail/path':
-                    return False
-                return True
-
             def get_model(self, connection):
                 return imgmodel.LocalFileImage(self.path,
                                                imgmodel.FORMAT_RAW)
@@ -14811,7 +14806,7 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 return_value=image_backend):
             self.flags(inject_partition=0, group='libvirt')
 
-            self.drvr._inject_data(**driver_params)
+            self.drvr._inject_data(image_backend, **driver_params)
 
             if called:
                 disk_inject_data.assert_called_once_with(
@@ -14826,8 +14821,7 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
             'instance': self._create_instance(params=params),
             'network_info': None,
             'admin_pass': None,
-            'files': None,
-            'suffix': ''
+            'files': None
         }
 
     def test_inject_data_adminpass(self):
@@ -15171,10 +15165,10 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                                     ).AndReturn(fake_imagebackend.Raw())
         imagebackend.Backend.image(instance, 'ramdisk.rescue', 'raw'
                                     ).AndReturn(fake_imagebackend.Raw())
-        imagebackend.Backend.image(instance, 'disk.rescue', 'default'
-                                    ).AndReturn(fake_imagebackend.Raw())
         imagebackend.Backend.image(instance, 'disk.config.rescue', 'raw'
                                    ).AndReturn(fake_imagebackend.Raw())
+        imagebackend.Backend.image(instance, 'disk.rescue', 'default'
+                                    ).AndReturn(fake_imagebackend.Raw())
 
         imagebackend.Image.cache(context=mox.IgnoreArg(),
                                 fetch_func=mox.IgnoreArg(),

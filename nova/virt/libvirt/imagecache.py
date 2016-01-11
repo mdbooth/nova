@@ -48,14 +48,6 @@ imagecache_opts = [
                        '%(image)s.info',
                help='Allows image information files to be stored in '
                     'non-standard locations'),
-    cfg.BoolOpt('remove_unused_kernels',
-                default=True,
-                deprecated_for_removal=True,
-                help='DEPRECATED: Should unused kernel images be removed? '
-                     'This is only safe to enable if all compute nodes have '
-                     'been updated to support this option (running Grizzly or '
-                     'newer level compute). This will be the default behavior '
-                     'in the 13.0.0 release.'),
     cfg.IntOpt('remove_unused_resized_minimum_age_seconds',
                default=3600,
                help='Unused resized base images younger than this will not be '
@@ -72,28 +64,15 @@ CONF = nova.conf.CONF
 CONF.register_opts(imagecache_opts, 'libvirt')
 
 
-def get_cache_fname(images, key):
+def get_cache_fname(image_id):
     """Return a filename based on the SHA1 hash of a given image ID.
 
     Image files stored in the _base directory that match this pattern
     are considered for cleanup by the image cache manager. The cache
     manager considers the file to be in use if it matches an instance's
     image_ref, kernel_id or ramdisk_id property.
-
-    However, in grizzly-3 and before, only the image_ref property was
-    considered. This means that it's unsafe to store kernel and ramdisk
-    images using this pattern until we're sure that all compute nodes
-    are running a cache manager newer than grizzly-3. For now, we
-    require admins to confirm that by setting the remove_unused_kernels
-    boolean but, at some point in the future, we'll be safely able to
-    assume this.
     """
-    image_id = str(images[key])
-    if ((not CONF.libvirt.remove_unused_kernels and
-         key in ['kernel_id', 'ramdisk_id'])):
-        return image_id
-    else:
-        return hashlib.sha1(image_id).hexdigest()
+    return hashlib.sha1(image_id).hexdigest()
 
 
 def get_info_filename(base_path):

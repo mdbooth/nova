@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import contextlib
 import copy
 import datetime
@@ -76,7 +77,6 @@ import nova.tests.unit.image.fake
 from nova.tests.unit import matchers
 from nova.tests.unit.objects import test_pci_device
 from nova.tests.unit.objects import test_vcpu_model
-from nova.tests.unit.virt.libvirt import fake_imagebackend
 from nova.tests.unit.virt.libvirt import fake_libvirt_utils
 from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova import utils
@@ -14532,7 +14532,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         context = 'fake_context'
 
         instance = self._create_instance()
-        self.mox.StubOutWithMock(imagebackend.Backend, 'image')
         self.mox.StubOutWithMock(libvirt_utils, 'get_instance_path')
         self.mox.StubOutWithMock(os.path, 'exists')
         self.mox.StubOutWithMock(shutil, 'rmtree')
@@ -14556,12 +14555,12 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 shutil.rmtree('/fake/foo')
             utils.execute('mv', '/fake/foo_resize', '/fake/foo')
 
-        imagebackend.Backend.image(mox.IgnoreArg(), 'disk').AndReturn(
-                fake_imagebackend.Raw())
-
         self.mox.ReplayAll()
 
-        self.drvr.finish_revert_migration(context, instance, [])
+        with mock.patch.object(imagebackend.Backend, 'image', autospec=True)\
+                as mock_image:
+            self.drvr.finish_revert_migration(context, instance, [])
+        mock_image.assert_called_once_with(mock.ANY, instance, 'disk')
 
     def test_finish_revert_migration_after_crash(self):
         self._test_finish_revert_migration_after_crash(backup_made=True)
@@ -14661,7 +14660,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
 
         self.stub_out('os.path.exists', fake_os_path_exists)
 
-        self.mox.StubOutWithMock(imagebackend.Backend, 'image')
         self.mox.StubOutWithMock(libvirt_utils, 'get_instance_path')
         self.mox.StubOutWithMock(utils, 'execute')
 
@@ -14669,12 +14667,13 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 forceold=True).AndReturn('/fake/inst')
         utils.execute('rm', '-rf', '/fake/inst_resize', delay_on_retry=True,
                       attempts=5)
-        imagebackend.Backend.image(ins_ref, 'disk').AndReturn(
-            fake_imagebackend.Raw())
 
         self.mox.ReplayAll()
-        self.drvr._cleanup_resize(ins_ref,
-                                            _fake_network_info(self, 1))
+
+        with mock.patch.object(imagebackend.Backend, 'image', autospec=True)\
+                as mock_image:
+            self.drvr._cleanup_resize(ins_ref, _fake_network_info(self, 1))
+        mock_image.assert_called_once_with(mock.ANY, ins_ref, 'disk')
 
     def test_cleanup_resize_not_same_host(self):
         CONF.set_override('policy_dirs', [], group='oslo_policy')
@@ -14701,7 +14700,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         self.stubs.Set(self.drvr.firewall_driver,
                        'unfilter_instance', fake_unfilter_instance)
 
-        self.mox.StubOutWithMock(imagebackend.Backend, 'image')
         self.mox.StubOutWithMock(libvirt_utils, 'get_instance_path')
         self.mox.StubOutWithMock(utils, 'execute')
 
@@ -14709,12 +14707,13 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 forceold=True).AndReturn('/fake/inst')
         utils.execute('rm', '-rf', '/fake/inst_resize', delay_on_retry=True,
                       attempts=5)
-        imagebackend.Backend.image(ins_ref, 'disk').AndReturn(
-                fake_imagebackend.Raw())
 
         self.mox.ReplayAll()
-        self.drvr._cleanup_resize(ins_ref,
-                                            _fake_network_info(self, 1))
+
+        with mock.patch.object(imagebackend.Backend, 'image', autospec=True)\
+                as mock_image:
+            self.drvr._cleanup_resize(ins_ref, _fake_network_info(self, 1))
+        mock_image.assert_called_once_with(mock.ANY, ins_ref, 'disk')
 
     def test_cleanup_resize_snap_backend(self):
         CONF.set_override('policy_dirs', [], group='oslo_policy')
@@ -15015,8 +15014,7 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         self.assertIn('the device is no longer found on the guest',
                       six.text_type(mock_log.warning.call_args[0]))
 
-    def test_rescue(self):
-        instance = self._create_instance({'config_drive': None})
+    def _test_rescue(self, instance):
         dummyxml = ("<domain type='kvm'><name>instance-0000000a</name>"
                     "<devices>"
                     "<disk type='file'><driver name='qemu' type='raw'/>"
@@ -15031,8 +15029,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.drvr,
                                      '_get_existing_domain_xml')
         self.mox.StubOutWithMock(libvirt_utils, 'write_to_file')
-        self.mox.StubOutWithMock(imagebackend.Backend, 'image')
-        self.mox.StubOutWithMock(imagebackend.Image, 'cache')
         self.mox.StubOutWithMock(self.drvr, '_get_guest_xml')
         self.mox.StubOutWithMock(self.drvr, '_destroy')
         self.mox.StubOutWithMock(self.drvr, '_create_domain')
@@ -15042,25 +15038,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         libvirt_utils.write_to_file(mox.IgnoreArg(), mox.IgnoreArg())
         libvirt_utils.write_to_file(mox.IgnoreArg(), mox.IgnoreArg(),
                                mox.IgnoreArg())
-        imagebackend.Backend.image(instance, 'kernel.rescue', 'raw'
-                                        ).AndReturn(fake_imagebackend.Raw())
-        imagebackend.Backend.image(instance, 'ramdisk.rescue', 'raw'
-                                        ).AndReturn(fake_imagebackend.Raw())
-        imagebackend.Backend.image(instance, 'disk.rescue', 'default'
-                                        ).AndReturn(fake_imagebackend.Raw())
-        imagebackend.Image.cache(context=mox.IgnoreArg(),
-                                fetch_func=mox.IgnoreArg(),
-                                filename=mox.IgnoreArg(),
-                                image_id=mox.IgnoreArg(),
-                                project_id=mox.IgnoreArg(),
-                                user_id=mox.IgnoreArg()).MultipleTimes()
-
-        imagebackend.Image.cache(context=mox.IgnoreArg(),
-                                fetch_func=mox.IgnoreArg(),
-                                filename=mox.IgnoreArg(),
-                                image_id=mox.IgnoreArg(),
-                                project_id=mox.IgnoreArg(),
-                                size=None, user_id=mox.IgnoreArg())
 
         image_meta = objects.ImageMeta.from_dict(
             {'id': 'fake', 'name': 'fake'})
@@ -15076,11 +15053,66 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
 
         self.mox.ReplayAll()
 
-        rescue_password = 'fake_password'
+        images = collections.defaultdict(mock.MagicMock)
 
-        self.drvr.rescue(self.context, instance,
-                    network_info, image_meta, rescue_password)
+        def log_images(self, instance, name, format,
+                       *args, **kwargs):
+            return images[name]
+
+        with mock.patch.object(imagebackend.Backend, 'image', autospec=True,
+                               side_effect=log_images) as mock_image:
+            self.drvr.rescue(self.context, instance, network_info,
+                             image_meta, 'password')
         self.mox.VerifyAll()
+
+        for name in ('kernel.rescue', 'ramdisk.rescue'):
+            mock_image.assert_any_call(mock.ANY, instance, name, 'raw')
+            image = images[name]
+            image.cache.assert_called_once_with(
+                    context=mock.ANY,
+                    fetch_func=mock.ANY,
+                    filename=mock.ANY,
+                    image_id=mock.ANY,
+                    project_id=mock.ANY,
+                    user_id=mock.ANY)
+
+        mock_image.assert_any_call(mock.ANY, instance, 'disk.rescue',
+                                   'default')
+        images['disk.rescue'].cache.assert_called_once_with(
+                context=mock.ANY,
+                fetch_func=mock.ANY,
+                filename=mock.ANY,
+                image_id=mock.ANY,
+                project_id=mock.ANY,
+                size=None,
+                user_id=mock.ANY)
+
+        return (mock_image, images)
+
+    def test_rescue(self):
+        instance = self._create_instance({'config_drive': None})
+
+        mock_image, images = self._test_rescue(instance)
+
+        self.assertEqual(['disk.rescue', 'kernel.rescue', 'ramdisk.rescue'],
+                         sorted(images.keys()))
+
+    @mock.patch('nova.api.metadata.base.InstanceMetadata', mock.MagicMock())
+    @mock.patch('nova.virt.configdrive.ConfigDriveBuilder.make_drive',
+                autospec=True)
+    def test_rescue_config_drive(self, mock_make_drive):
+        instance = self._create_instance()
+
+        mock_image, images = self._test_rescue(instance)
+
+        self.assertEqual(['disk.config.rescue', 'disk.rescue',
+                          'kernel.rescue', 'ramdisk.rescue'],
+                         sorted(images.keys()))
+
+        configdrive_path = \
+            os.path.join(libvirt_utils.get_instance_path(instance),
+            'disk.config.rescue')
+        mock_make_drive.assert_called_once_with(mock.ANY, configdrive_path)
 
     @mock.patch.object(libvirt_utils, 'get_instance_path')
     @mock.patch.object(libvirt_utils, 'load_file')
@@ -15125,92 +15157,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                              mock_del.call_args_list[0][0][0])
             self.assertEqual(rescue_file, mock_del.call_args_list[1][0][0])
             mock_remove_volumes.assert_called_once_with(['lvm.rescue'])
-
-    @mock.patch(
-        'nova.virt.configdrive.ConfigDriveBuilder.add_instance_metadata')
-    @mock.patch('nova.virt.configdrive.ConfigDriveBuilder.make_drive')
-    def test_rescue_config_drive(self, mock_make, mock_add):
-        instance = self._create_instance()
-        uuid = instance.uuid
-        configdrive_path = uuid + '/disk.config.rescue'
-        dummyxml = ("<domain type='kvm'><name>instance-0000000a</name>"
-                    "<devices>"
-                    "<disk type='file'><driver name='qemu' type='raw'/>"
-                    "<source file='/test/disk'/>"
-                    "<target dev='vda' bus='virtio'/></disk>"
-                    "<disk type='file'><driver name='qemu' type='qcow2'/>"
-                    "<source file='/test/disk.local'/>"
-                    "<target dev='vdb' bus='virtio'/></disk>"
-                    "</devices></domain>")
-        network_info = _fake_network_info(self, 1)
-
-        self.mox.StubOutWithMock(self.drvr,
-                                    '_get_existing_domain_xml')
-        self.mox.StubOutWithMock(libvirt_utils, 'write_to_file')
-        self.mox.StubOutWithMock(imagebackend.Backend, 'image')
-        self.mox.StubOutWithMock(imagebackend.Image, 'cache')
-        self.mox.StubOutWithMock(instance_metadata.InstanceMetadata,
-                                                            '__init__')
-        self.mox.StubOutWithMock(self.drvr, '_get_guest_xml')
-        self.mox.StubOutWithMock(self.drvr, '_destroy')
-        self.mox.StubOutWithMock(self.drvr, '_create_domain')
-
-        self.drvr._get_existing_domain_xml(mox.IgnoreArg(),
-                    mox.IgnoreArg()).MultipleTimes().AndReturn(dummyxml)
-        libvirt_utils.write_to_file(mox.IgnoreArg(), mox.IgnoreArg())
-        libvirt_utils.write_to_file(mox.IgnoreArg(), mox.IgnoreArg(),
-                                    mox.IgnoreArg())
-
-        imagebackend.Backend.image(instance, 'kernel.rescue', 'raw'
-                                    ).AndReturn(fake_imagebackend.Raw())
-        imagebackend.Backend.image(instance, 'ramdisk.rescue', 'raw'
-                                    ).AndReturn(fake_imagebackend.Raw())
-        imagebackend.Backend.image(instance, 'disk.config.rescue', 'raw'
-                                   ).AndReturn(fake_imagebackend.Raw())
-        imagebackend.Backend.image(instance, 'disk.rescue', 'default'
-                                    ).AndReturn(fake_imagebackend.Raw())
-
-        imagebackend.Image.cache(context=mox.IgnoreArg(),
-                                fetch_func=mox.IgnoreArg(),
-                                filename=mox.IgnoreArg(),
-                                image_id=mox.IgnoreArg(),
-                                project_id=mox.IgnoreArg(),
-                                user_id=mox.IgnoreArg()).MultipleTimes()
-
-        imagebackend.Image.cache(context=mox.IgnoreArg(),
-                                fetch_func=mox.IgnoreArg(),
-                                filename=mox.IgnoreArg(),
-                                image_id=mox.IgnoreArg(),
-                                project_id=mox.IgnoreArg(),
-                                size=None, user_id=mox.IgnoreArg())
-
-        instance_metadata.InstanceMetadata.__init__(mox.IgnoreArg(),
-                                            content=mox.IgnoreArg(),
-                                            extra_md=mox.IgnoreArg(),
-                                            network_info=mox.IgnoreArg())
-        image_meta = objects.ImageMeta.from_dict(
-            {'id': 'fake', 'name': 'fake'})
-        self.drvr._get_guest_xml(mox.IgnoreArg(), instance,
-                                 network_info, mox.IgnoreArg(),
-                                 image_meta,
-                                 rescue=mox.IgnoreArg(),
-                                 write_to_disk=mox.IgnoreArg()
-                                ).AndReturn(dummyxml)
-        self.drvr._destroy(instance)
-        self.drvr._create_domain(mox.IgnoreArg())
-
-        self.mox.ReplayAll()
-
-        rescue_password = 'fake_password'
-
-        self.drvr.rescue(self.context, instance, network_info,
-                                                image_meta, rescue_password)
-        self.mox.VerifyAll()
-
-        mock_add.assert_any_call(mock.ANY)
-        expected_call = [mock.call(os.path.join(CONF.instances_path,
-                                                configdrive_path))]
-        mock_make.assert_has_calls(expected_call)
 
     @mock.patch('shutil.rmtree')
     @mock.patch('nova.utils.execute')

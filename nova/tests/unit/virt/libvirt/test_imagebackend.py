@@ -41,9 +41,52 @@ from nova.virt import images
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import imagebackend
 from nova.virt.libvirt.storage import rbd_utils
+from nova.virt.libvirt import utils as libvirt_utils
 
 CONF = cfg.CONF
 CONF.import_opt('fixed_key', 'nova.keymgr.conf_key_mgr', group='keymgr')
+
+
+class ImportFileFixture(fixtures.Fixture):
+    def __init__(self, test, mocks=None):
+        super(ImportFileFixture, self).__init__()
+        self.test = test
+
+        self.mocks = {
+            'preallocate': (imagebackend.Image, 'preallocate_disk'),
+            'image_convert': (images, 'convert_image'),
+            'create_image': (libvirt_utils, 'create_image')
+        }
+        if mocks is not None:
+            self.mocks.update(mocks)
+
+    def _setUp(self):
+        super(ImportFileFixture, self)._setUp()
+        self.test_size = 1 * units.Mi
+
+        for k, v in self.mocks.items():
+            patcher = mock.patch.object(*v, autospec=True)
+            m = patcher.start()
+            self.addCleanup(patcher.stop)
+            setattr(self, 'mock_' + k, m)
+
+    def assert_disk_locked(self, disk, state=True):
+        # We pull this out here because this assumes an implementation
+        # detail of disk.lock(). If we ever change that, we can update the
+        # details here.
+        self.test.assertEqual(state, disk.locked)
+
+    def assert_size_and_format(self, path, format, preallocated=None):
+        # Assert that we created a file of the correct size and format
+        self.mock_create_image.assert_any_call(format, path, self.test_size)
+
+        if preallocated is not None:
+            if preallocated:
+                self.mock_preallocate.assert_any_call(mock.ANY, self.test_size)
+            else:
+                call = mock.call(mock.ANY, self.test_size)
+                self.test.assertNotIn(self.mock_preallocate.call_args_list,
+                                      call)
 
 
 class FakeSecret(object):
@@ -408,6 +451,98 @@ class NoBackingTestCase(_ImageTestCase, test.NoDBTestCase):
         self.assertEqual(imgmodel.LocalFileImage(self.PATH,
                                                  imgmodel.FORMAT_RAW),
                          model)
+
+
+class NoBackingImportFileTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(NoBackingImportFileTestCase, self).setUp()
+
+        mocks = {
+            'correct_format': (imagebackend.NoBacking, 'correct_format'),
+            'can_fallocate': (imagebackend.NoBacking, '_can_fallocate')
+        }
+        self.helper = self.useFixture(ImportFileFixture(self, mocks))
+        self.helper.mock_can_fallocate.return_value = True
+
+        self.path = os.path.join('/', uuidutils.generate_uuid())
+
+    def test_import_file(self):
+        # Test that import file creates a file of the expected size,
+        # and persists the data that we write to it in the correct location.
+
+        self.flags(preallocate_images='')
+
+        disk = imagebackend.NoBacking(path=self.path)
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                              self.helper.test_size) as import_path:
+            # Implementation detail: Assert that the path we were
+            # given is the final destination. Means we don't have to test
+            # that the resulting file is the same as the import file.
+            self.assertEqual(self.path, import_path)
+
+            self.helper.assert_disk_locked(disk)
+            self.helper.assert_size_and_format(import_path,
+                                               imgmodel.FORMAT_RAW,
+                                               preallocated=False)
+
+        self.helper.assert_disk_locked(disk, False)
+        self.assertTrue(self.helper.mock_correct_format.called)
+
+    def test_import_file_existing(self):
+        # Test that import_file when a file already exists doesn't overwrite
+        # the existing file.
+
+        disk = imagebackend.NoBacking(path=self.path)
+        with mock.patch.object(disk, 'exists', return_value=True):
+            with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                                  self.helper.test_size) as import_path:
+                # We should not have created a new image
+                self.assertFalse(self.helper.mock_create_image.called)
+
+                # We should be writing directly to the underlying image
+                self.assertEqual(self.path, import_path)
+
+    def test_import_file_preallocate(self):
+        # Test that specifying preallocate_images results in a preallocated
+        # file.
+        self.flags(preallocate_images='space')
+
+        disk = imagebackend.NoBacking(path=self.path)
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                              self.helper.test_size):
+            pass
+
+        self.helper.assert_size_and_format(self.path, imgmodel.FORMAT_RAW,
+                                           preallocated=True)
+
+    def test_import_file_preallocate_unsupported(self):
+        # Test that specifying preallocate_images when fallocate is not
+        # supported will not produce an error, and will not preallocate
+        self.flags(preallocate_images='space')
+        self.helper.mock_can_fallocate.return_value = False
+
+        disk = imagebackend.NoBacking(path=self.path)
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                              self.helper.test_size):
+            pass
+
+        self.helper.assert_size_and_format(self.path, imgmodel.FORMAT_RAW,
+                                           preallocated=False)
+
+        # The test that no exception was raised is implicit
+
+    def test_import_file_non_raw(self):
+        # Test that attempting to import anything other than raw will raise
+        # NotImplementedError
+        disk = imagebackend.NoBacking(path=self.path)
+
+        def _test():
+            with disk.import_file(mock.sentinel.context,
+                                  imgmodel.FORMAT_QCOW2,
+                                  self.helper.test_size):
+                pass
+
+        self.assertRaises(NotImplementedError, _test)
 
 
 class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
@@ -1470,40 +1605,6 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
             ["server1:1899", "server2:1920"]),
                          model)
 
-    def test_import_file(self):
-        image = self.image_class(self.INSTANCE, self.NAME)
-
-        @mock.patch.object(image, 'exists')
-        @mock.patch.object(image.driver, 'remove_image')
-        @mock.patch.object(image.driver, 'import_image')
-        def _test(mock_import, mock_remove, mock_exists):
-            mock_exists.return_value = True
-            image.import_file(self.INSTANCE, mock.sentinel.file,
-                              mock.sentinel.remote_name)
-            name = '%s_%s' % (self.INSTANCE.uuid,
-                              mock.sentinel.remote_name)
-            mock_exists.assert_called_once_with()
-            mock_remove.assert_called_once_with(name)
-            mock_import.assert_called_once_with(mock.sentinel.file, name)
-        _test()
-
-    def test_import_file_not_found(self):
-        image = self.image_class(self.INSTANCE, self.NAME)
-
-        @mock.patch.object(image, 'exists')
-        @mock.patch.object(image.driver, 'remove_image')
-        @mock.patch.object(image.driver, 'import_image')
-        def _test(mock_import, mock_remove, mock_exists):
-            mock_exists.return_value = False
-            image.import_file(self.INSTANCE, mock.sentinel.file,
-                              mock.sentinel.remote_name)
-            name = '%s_%s' % (self.INSTANCE.uuid,
-                              mock.sentinel.remote_name)
-            mock_exists.assert_called_once_with()
-            self.assertFalse(mock_remove.called)
-            mock_import.assert_called_once_with(mock.sentinel.file, name)
-        _test()
-
     def test_get_parent_pool(self):
         image = self.image_class(self.INSTANCE, self.NAME)
         with mock.patch.object(rbd_utils.RBDDriver, 'parent_info') as mock_pi:
@@ -1634,6 +1735,84 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
                                             pool=image.pool)
             mock_destroy.assert_called_once_with(image.rbd_name,
                                                  pool=image.pool)
+
+
+class RbdImportFileTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(RbdImportFileTestCase, self).setUp()
+
+        self.helper = self.useFixture(ImportFileFixture(self))
+
+        patcher = mock.patch.object(rbd_utils, 'RBDDriver', autospec=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        instance = objects.Instance(id=1, uuid=uuidutils.generate_uuid())
+        self.disk = imagebackend.Rbd(instance=instance, disk_name='disk')
+        self.driver = self.disk.driver
+
+        # This is copied from imagebackend.Rbd. We need to keep this copy
+        # here as a canary in case of changes to the Rbd class. This name
+        # must remain consistent for compatibility, or else the change must
+        # be handled explicitly
+        self.rbd_name = '%s_%s' % (instance.uuid, 'disk')
+
+    def test_import_file(self):
+        # Test that importing a raw file results in the appropriate call to
+        # import_image
+
+        self.driver.exists.return_value = False
+
+        with self.disk.import_file(mock.sentinel.context,
+                                   imgmodel.FORMAT_RAW,
+                                   self.helper.test_size) as path:
+            # Assert that we've been given a correctly pre-created file to
+            # import into if required.
+            self.helper.assert_size_and_format(path, imgmodel.FORMAT_RAW)
+
+            self.helper.assert_disk_locked(self.disk)
+
+        self.helper.assert_disk_locked(self.disk, False)
+
+        # Assert that we imported the import file
+        self.driver.import_image.assert_called_once_with(path, self.rbd_name)
+
+    def test_import_file_exists(self):
+        # Test that importing a raw file which already exists in rbd removes
+        # the existing rbd volume before importing a new one
+        self.driver.exists.return_value = True
+
+        # When remove_image is called, import_image should not have been
+        # called yet.
+        self.driver.remove_image.side_effect = \
+            lambda *args: self.assertFalse(self.driver.import_image.called)
+
+        with self.disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                                   self.helper.test_size):
+            pass
+
+        self.assertTrue(self.driver.remove_image.called)
+        self.assertTrue(self.driver.import_image.called)
+
+    def test_import_file_qcow2(self):
+        # Test that importing a qcow2 file correctly converts to raw before
+        # import
+        self.driver.exists.return_value = False
+
+        with self.disk.import_file(mock.sentinel.context,
+                                   imgmodel.FORMAT_QCOW2,
+                                   self.helper.test_size) as path:
+            # Assert that we were given a QCOW2 file of the correct size
+            self.helper.assert_size_and_format(path, imgmodel.FORMAT_QCOW2)
+
+        # Assert that we converted the import file
+        self.helper.mock_image_convert.assert_called_once_with(
+            path, mock.ANY, imgmodel.FORMAT_QCOW2, imgmodel.FORMAT_RAW)
+
+        dest = self.helper.mock_image_convert.call_args[0][1]
+
+        # Assert that we imported the converted file
+        self.driver.import_image.assert_called_once_with(dest, self.rbd_name)
 
 
 class PloopTestCase(_ImageTestCase, test.NoDBTestCase):

@@ -3155,31 +3155,22 @@ class LibvirtDriver(driver.ComputeDriver):
             inst_md = instance_metadata.InstanceMetadata(instance,
                 content=files, extra_md=extra_md, network_info=network_info)
             with configdrive.ConfigDriveBuilder(instance_md=inst_md) as cdb:
-                configdrive_path = self._get_disk_config_path(instance, suffix)
-                LOG.info(_LI('Creating config drive at %(path)s'),
-                         {'path': configdrive_path}, instance=instance)
-
-                try:
-                    cdb.make_drive(configdrive_path)
-                except processutils.ProcessExecutionError as e:
-                    with excutils.save_and_reraise_exception():
-                        LOG.error(_LE('Creating config drive failed '
-                                      'with error: %s'),
-                                  e, instance=instance)
-
-            try:
-                # Tell the storage backend about the config drive
-                config_drive_image = self.image_backend.image(
+                config_drive = self.image_backend.image(
                     instance, 'disk.config' + suffix,
                     self._get_disk_config_image_type())
 
-                config_drive_image.import_file(
-                    instance, configdrive_path, 'disk.config' + suffix)
-            finally:
-                # NOTE(mikal): if the config drive was imported into RBD, then
-                # we no longer need the local copy
-                if CONF.libvirt.images_type == 'rbd':
-                    os.unlink(configdrive_path)
+                LOG.info(_LI('Creating config drive at %(path)s'),
+                         {'path': config_drive.path}, instance=instance)
+
+                with config_drive.import_file(context, imgmodel.FORMAT_RAW) \
+                        as config_drive_path:
+                    try:
+                        cdb.make_drive(config_drive_path)
+                    except processutils.ProcessExecutionError as e:
+                        with excutils.save_and_reraise_exception():
+                            LOG.error(_LE('Creating config drive failed '
+                                          'with error: %s'),
+                                      e, instance=instance)
 
         need_inject = (config_drive_image is None and inject_files and
                        CONF.libvirt.inject_partition != -2)

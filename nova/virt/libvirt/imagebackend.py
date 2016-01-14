@@ -217,6 +217,12 @@ class Image(object):
     def exists(self):
         return os.path.exists(self.path)
 
+    def preallocate_disk(self, size, path=None):
+        if path is None:
+            path = self.path
+
+        utils.execute('fallocate', '-n', '-l', size, path)
+
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
         """Creates image from template.
 
@@ -252,7 +258,7 @@ class Image(object):
 
             if (self.preallocate and self._can_fallocate() and
                     os.access(self.path, os.W_OK)):
-                utils.execute('fallocate', '-n', '-l', size, self.path)
+                self.preallocate_disk(size)
 
     def _can_fallocate(self):
         """Check once per class, whether fallocate(1) is available,
@@ -447,22 +453,24 @@ class Image(object):
                 finally:
                     self.locked = False
 
-    def import_file(self, instance, local_file, remote_name):
-        """Import an image from local storage into this backend.
+    def import_file(self, context, format, size=None):
+        """Import from a local file.
 
-        Import a local file into the store used by this image type. Note that
-        this is a noop for stores using local disk (the local file is
-        considered "in the store").
+        Yields a path which must be written to within the returned context.
+        When the context exits, the contents of this path will be imported
+        into the underlying store.
 
-        If the image already exists it will be overridden by the new file
+        If the image already exists it will be overwritten by the new file
 
-        :param local_file: path to the file to import
-        :param remote_name: the name for the file in the store
+        Args:
+            context: A RequestContext
+            format: The format of the data being imported
+            size: The size of the data to be imported (in bytes)
         """
-
-        # NOTE(mikal): this is a noop for now for all stores except RBD, but
-        # we should talk about if we want this functionality for everything.
-        pass
+        # This should be abstract, but we don't have implementations for all
+        # subclasses, yet (and they're not required, yet). This will be
+        # fixed up in a later patch.
+        raise NotImplementedError()
 
     def create_snap(self, name):
         """Create a snapshot on the image.  A noop on backends that don't
@@ -537,6 +545,43 @@ class NoBacking(Image):
     def correct_format(self):
         if os.path.exists(self.path):
             self.driver_format = self.resolve_driver_format()
+
+    @contextlib.contextmanager
+    def import_file(self, context, format, size=0):
+        # We haven't implemented format conversion when importing raw,
+        # because nothing currently uses it.
+        if format != imgmodel.FORMAT_RAW:
+            raise NotImplementedError()
+
+        @contextlib.contextmanager
+        def _create_and_cleanup_on_error():
+            with fileutils.remove_path_on_error(self.path):
+                # Create a sparse output file of the correct size
+                # Ideally we'd fallocate it here, but some operations will
+                # truncate or overwrite the file, so we'd lose it. Instead,
+                # we create a placeholder for operations which require it,
+                # and fallocate afterwards.
+                libvirt_utils.create_image(format, self.path, size)
+                yield
+
+        @contextlib.contextmanager
+        def _no_cleanup():
+            yield
+
+        with self.lock():
+            # Be sure we reuse any existing file, and don't delete an
+            # existing file on error.
+            cleanup = _no_cleanup \
+                if self.exists() else _create_and_cleanup_on_error
+
+            with cleanup():
+                yield self.path
+
+                if self.preallocate and self._can_fallocate():
+                    self.preallocate_disk(size)
+
+                # Write out the file format to disk.info
+                self.correct_format()
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = self._get_lock_name(base)
@@ -954,11 +999,28 @@ class Rbd(Image):
                                  secret,
                                  servers)
 
-    def import_file(self, instance, local_file, remote_name):
-        name = '%s_%s' % (instance.uuid, remote_name)
-        if self.exists():
-            self.driver.remove_image(name)
-        self.driver.import_image(local_file, name)
+    @contextlib.contextmanager
+    def import_file(self, context, format, size=0):
+        # NOTE: RBD supports locking, but this isn't yet exposed through
+        # RBDDriver. We should do proper locking here. This mirrors current
+        # behaviour, which uses a lock in the instance directory. This will
+        # only work between hosts if there are shared instance directories.
+        # We should subclass lock() for the Rbd backend to implement this.
+        with self.lock():
+            with utils.tempdir() as tempdir:
+                import_file = os.path.join(tempdir, 'rbd_import')
+                libvirt_utils.create_image(format, import_file, size)
+                yield import_file
+
+                if format != imgmodel.FORMAT_RAW:
+                    converted_file = os.path.join(tempdir, 'rbd_converted')
+                    images.convert_image(import_file, converted_file, format,
+                                         imgmodel.FORMAT_RAW)
+                    import_file = converted_file
+
+                if self.exists():
+                    self.driver.remove_image(self.rbd_name)
+                self.driver.import_image(import_file, self.rbd_name)
 
     def create_snap(self, name):
         return self.driver.create_snap(self.rbd_name, name)

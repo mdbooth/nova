@@ -9165,6 +9165,11 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def snapshot(self, name):
                     pass
 
+                @contextlib.contextmanager
+                def import_file(self, context, format, size=None):
+                    gotFiles.append({'filename': self.path, 'size': size})
+                    yield self.path
+
             return FakeImage(instance, name)
 
         def fake_none(*args, **kwargs):
@@ -9278,6 +9283,10 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def snapshot(self, name):
                     pass
 
+                @contextlib.contextmanager
+                def import_file(self, context, format, size=None):
+                    yield self.path
+
             return FakeImage(instance, name)
 
         instance_ref = self.test_instance
@@ -9344,9 +9353,10 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                     gotFiles.append({'filename': filename,
                                      'size': size})
 
-                def import_file(self, instance, local_filename,
-                                remote_filename):
-                    imported_files.append((local_filename, remote_filename))
+                @contextlib.contextmanager
+                def import_file(self, context, format, size=None):
+                    yield self.path
+                    imported_files.append(self.path)
 
                 def snapshot(self, name):
                     pass
@@ -9414,8 +9424,7 @@ class LibvirtConnTestCase(test.NoDBTestCase):
         # Ensure that we create a config drive and then import it into the
         # image backend store
         _, imported_files = self._create_image_helper(enable_configdrive)
-        self.assertTrue(imported_files[0][0].endswith('/disk.config'))
-        self.assertEqual('disk.config', imported_files[0][1])
+        self.assertTrue(imported_files[0].endswith('/disk.config'))
 
     def test_create_image_with_configdrive_rescue(self):
         def enable_configdrive(instance_ref):
@@ -9425,8 +9434,7 @@ class LibvirtConnTestCase(test.NoDBTestCase):
         # image backend store
         _, imported_files = self._create_image_helper(enable_configdrive,
                                                       suffix='.rescue')
-        self.assertTrue(imported_files[0][0].endswith('/disk.config.rescue'))
-        self.assertEqual('disk.config.rescue', imported_files[0][1])
+        self.assertTrue(imported_files[0].endswith('/disk.config.rescue'))
 
     @mock.patch.object(nova.virt.libvirt.imagebackend.Image, 'cache',
                        side_effect=exception.ImageNotFound(image_id='fake-id'))
@@ -15083,7 +15091,14 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
 
         def log_images(self, instance, name, format,
                        *args, **kwargs):
-            return images[name]
+            image = images[name]
+
+            # Ensure that import_file yields the path of the current disk
+            image.import_file.return_value.__enter__.return_value = \
+                os.path.join(libvirt_utils.get_instance_path(instance),
+                             name)
+
+            return image
 
         with mock.patch.object(imagebackend.Backend, 'image', autospec=True,
                                side_effect=log_images) as mock_image:

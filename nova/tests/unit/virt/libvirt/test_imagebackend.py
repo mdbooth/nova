@@ -2326,6 +2326,96 @@ class PloopTestCase(_ImageTestCase, test.NoDBTestCase):
         image.cache(fake_fetch, self.TEMPLATE_PATH, self.SIZE)
 
 
+class PloopImportFileTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(PloopImportFileTestCase, self).setUp()
+
+        mocks = {
+            'resolve_driver_format': (imagebackend.Ploop,
+                                      'resolve_driver_format'),
+            'restore_descriptor': (imagebackend.Ploop, '_restore_descriptor'),
+            'resize_image': (imagebackend.Ploop, 'resize_image')
+        }
+        self.helper = self.useFixture(ImportFileFixture(self, mocks))
+
+        tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tempdir)
+
+        self.path = os.path.join(tempdir, uuidutils.generate_uuid())
+
+    def test_import_file(self):
+        disk = imagebackend.Ploop(path=self.path)
+
+        root_hds = os.path.join(self.path, 'root.hds')
+
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                              self.helper.test_size) as import_file:
+            self.helper.assert_disk_locked(disk)
+
+            # Create the import file
+            with open(import_file, 'w'):
+                pass
+
+        self.helper.assert_disk_locked(disk, False)
+
+        # The disk path should exist, and be a directory
+        self.assertTrue(os.path.isdir(self.path))
+
+        # It should contain root.hds
+        self.assertTrue(os.path.isfile(root_hds))
+
+        self.helper.mock_restore_descriptor.assert_called_once_with(
+            disk, self.path, imgmodel.FORMAT_RAW, root_hds)
+
+        self.helper.mock_resize_image.assert_called_once_with(
+            disk, self.helper.test_size)
+
+    def test_import_file_ploop(self):
+        disk = imagebackend.Ploop(path=self.path)
+
+        root_hds = os.path.join(self.path, 'root.hds')
+
+        with disk.import_file(mock.sentinel.context, 'ploop',
+                              self.helper.test_size):
+            pass
+
+        # We should have called ploop restore-descriptor with the
+        # correct format
+        self.helper.mock_restore_descriptor.assert_called_once_with(
+            disk, self.path, 'ploop', root_hds)
+
+    def test_import_file_unsupported(self):
+        disk = imagebackend.Ploop(path=self.path)
+
+        def _test():
+            with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_QCOW2,
+                                  self.helper.test_size):
+                pass
+
+        self.assertRaises(NotImplementedError, _test)
+
+    def test_import_file_cleanup_on_error(self):
+        class FakeException(Exception):
+            pass
+
+        disk = imagebackend.Ploop(path=self.path)
+
+        try:
+            with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                                  self.helper.test_size) as import_file:
+                # Ensure that import_file exists
+                with open(import_file, 'w'):
+                    pass
+                self.assertTrue(os.path.isfile(import_file))
+
+                raise FakeException()
+        except FakeException:
+            pass
+
+        # Ensure that import_file no longer exists
+        self.assertFalse(os.path.isfile(import_file))
+
+
 class BackendTestCase(test.NoDBTestCase):
     INSTANCE = objects.Instance(id=1, uuid=uuidutils.generate_uuid())
     NAME = 'fake-name.suffix'

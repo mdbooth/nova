@@ -1336,12 +1336,9 @@ class Ploop(Image):
         def create_ploop_image(base, target, size):
             image_path = os.path.join(target, "root.hds")
             libvirt_utils.copy_image(base, image_path)
-            utils.execute('ploop', 'restore-descriptor', '-f', self.pcs_format,
-                          target, image_path)
+            self._restore_descriptor(target, self.pcs_format, image_path)
             if size:
-                dd_path = os.path.join(self.path, "DiskDescriptor.xml")
-                utils.execute('ploop', 'grow', '-s', '%dK' % (size >> 10),
-                              dd_path, run_as_root=True)
+                self.resize_image(size)
 
         if not os.path.exists(self.path):
             if CONF.force_raw_images:
@@ -1381,6 +1378,26 @@ class Ploop(Image):
         dd_path = os.path.join(self.path, "DiskDescriptor.xml")
         utils.execute('ploop', 'grow', '-s', '%dK' % (size >> 10), dd_path,
                       run_as_root=True)
+
+    def _restore_descriptor(self, path, format, image_path):
+        utils.execute('ploop', 'restore-descriptor', '-f', format,
+                      path, image_path)
+
+    @contextlib.contextmanager
+    def import_file(self, context, format, size=None):
+        if format not in (imgmodel.FORMAT_RAW, 'ploop'):
+            raise NotImplementedError('Ploop can only import raw and ploop')
+
+        with self.lock():
+            remove_func = functools.partial(fileutils.delete_if_exists,
+                                            remove=shutil.rmtree)
+            with fileutils.remove_path_on_error(self.path, remove=remove_func):
+                fileutils.ensure_tree(self.path)
+                image_path = os.path.join(self.path, "root.hds")
+                yield image_path
+                self._restore_descriptor(self.path, format, image_path)
+                if size is not None:
+                    self.resize_image(size)
 
     def snapshot_extract(self, target, out_format):
         img_path = os.path.join(self.path, "root.hds")

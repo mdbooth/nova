@@ -871,7 +871,7 @@ class Lvm(Image):
     def __init__(self, instance=None, disk_name=None, path=None):
         super(Lvm, self).__init__("block", "raw", is_block_dev=True)
 
-        self.ephemeral_key_uuid = instance.get('ephemeral_key_uuid')
+        self.ephemeral_key_uuid = instance.ephemeral_key_uuid
 
         if self.ephemeral_key_uuid is not None:
             self.key_manager = keymgr.API()
@@ -913,6 +913,55 @@ class Lvm(Image):
 
     def _can_fallocate(self):
         return False
+
+    @contextlib.contextmanager
+    def import_file(self, context, format, size=0):
+        @contextlib.contextmanager
+        def _import_direct():
+            # Import direct to LVM
+            with self.remove_volume_on_error(self.path):
+                lvm.create_volume(self.vg, self.lv, size, sparse=self.sparse)
+                if self.ephemeral_key_uuid is not None:
+                    try:
+                        # NOTE(dgenin): Key manager corresponding to the
+                        # specific backend catches and reraises an
+                        # an exception if key retrieval fails.
+                        key = self.key_manager.get_key(
+                                context, self.ephemeral_key_uuid).get_encoded()
+                    except Exception:
+                        with excutils.save_and_reraise_exception():
+                            LOG.error(_LE("Failed to retrieve ephemeral "
+                                          "encryption key"))
+                    dmcrypt.create_volume(
+                            self.path.rpartition('/')[2], self.lv_path,
+                            CONF.ephemeral_storage_encryption.cipher,
+                            CONF.ephemeral_storage_encryption.key_size,
+                            key)
+
+                # NOTE: This is a wart, because the caller must know they need
+                # to be root to write to it. It would be both cleaner and more
+                # secure to chown this path to the nova user, and chown it back
+                # again afterwards.
+                yield self.path
+
+        with self.lock():
+            # If we're importing a raw file of known size, we can import direct
+            if size is not None and format == imgmodel.FORMAT_RAW:
+                with _import_direct() as path:
+                    yield path
+
+            # Otherwise we need to import to an intermediate temporary file and
+            # convert the input
+            else:
+                with utils.tempdir() as tempdir:
+                    tempfile = os.path.join(tempdir, 'lvm_import')
+                    libvirt_utils.create_image(format, tempfile, size)
+                    yield tempfile
+
+                    with _import_direct() as path:
+                        images.convert_image(tempfile, path, format,
+                                             self.driver_format,
+                                             run_as_root=True)
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         def encrypt_lvm_image():

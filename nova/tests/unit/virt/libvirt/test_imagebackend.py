@@ -44,6 +44,8 @@ from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import imagebackend
+from nova.virt.libvirt.storage import dmcrypt
+from nova.virt.libvirt.storage import lvm
 from nova.virt.libvirt.storage import rbd_utils
 from nova.virt.libvirt import utils as libvirt_utils
 
@@ -1607,6 +1609,187 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
         model = image.get_model(FakeConn())
         self.assertEqual(imgmodel.LocalBlockImage(self.PATH),
                          model)
+
+
+class LvmImportFileTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(LvmImportFileTestCase, self).setUp()
+
+        mocks = {
+            'lvm_create': (lvm, 'create_volume'),
+            'lvm_remove': (lvm, 'remove_volumes'),
+            'dmcrypt_create': (dmcrypt, 'create_volume'),
+            'dmcrypt_remove': (dmcrypt, 'delete_volume'),
+            'keymgr_api': (keymgr, 'API')
+        }
+        self.helper = self.useFixture(ImportFileFixture(self, mocks))
+
+        self.instance = mock.MagicMock(uuid=uuidutils.generate_uuid(),
+                                       ephemeral_key_uuid=None)
+
+        self.disk_name = 'disk'
+        self.vg = uuidutils.generate_uuid()
+        self.lv = self.instance.uuid + '_' + self.disk_name
+
+        self.flags(group='libvirt', images_volume_group=self.vg)
+
+        self.lv_path = os.path.join('/dev', self.vg, self.lv)
+
+    def configure_encryption(self):
+        self.instance.ephemeral_key_uuid = mock.sentinel.ephemeral_key_uuid
+
+        self.flags(group='ephemeral_storage_encryption',
+                   cipher=mock.sentinel.cipher,
+                   key_size=mock.sentinel.key_size)
+
+        self.dmcrypt_name = dmcrypt.volume_name(self.lv)
+        self.dmcrypt_path = os.path.join('/dev', 'mapper', self.dmcrypt_name)
+
+    def test_import_file(self):
+        # Test that importing raw creates an appropriate LVM volume and
+        # writes directly to it
+        disk = imagebackend.Lvm(instance=self.instance,
+                                disk_name=self.disk_name)
+
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                              self.helper.test_size) as import_path:
+            self.helper.assert_disk_locked(disk)
+
+            self.helper.mock_lvm_create.assert_called_once_with(
+                self.vg, self.lv, self.helper.test_size, sparse=False)
+
+            # We should be writing direct to an LVM disk
+            self.assertEqual(self.lv_path, import_path)
+
+        self.helper.assert_disk_locked(disk, False)
+
+    def test_encrypted_import_file(self):
+        # Test that importing raw creates an appropriate dmcrypt device and
+        # writes directly to it
+        self.configure_encryption()
+
+        disk = imagebackend.Lvm(instance=self.instance,
+                                disk_name=self.disk_name)
+
+        # Assert ordering (lvm_create before dmcrypt_create)
+        self.helper.mock_dmcrypt_create.side_effect = lambda *args, **kwargs: \
+            self.helper.mock_lvm_create.assert_called_once_with(
+                self.vg, self.lv, self.helper.test_size, sparse=False)
+
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                              self.helper.test_size) as import_path:
+            self.helper.assert_disk_locked(disk)
+
+            # We should have fetched a key for this instance from the key
+            # manager
+            get_key = disk.key_manager.get_key
+            get_key.assert_called_once_with(
+                mock.sentinel.context, self.instance.ephemeral_key_uuid)
+            key = get_key.return_value.get_encoded.return_value
+
+            # Ensure we correctly created the dmcrypt device
+            self.helper.mock_dmcrypt_create.assert_called_once_with(
+                self.dmcrypt_name, self.lv_path,
+                mock.sentinel.cipher, mock.sentinel.key_size, key)
+
+            # We should be writing direct to the dmcrypt device
+            self.assertEqual(self.dmcrypt_path, import_path)
+
+        self.helper.assert_disk_locked(disk, False)
+
+    def test_import_file_sparse(self):
+        # Test that specifying sparse will create a sparse volume
+        self.flags(group='libvirt', sparse_logical_volumes=True)
+
+        disk = imagebackend.Lvm(instance=self.instance,
+                                disk_name=self.disk_name)
+
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                              self.helper.test_size) as import_path:
+            self.helper.assert_disk_locked(disk)
+
+            self.helper.mock_lvm_create.assert_called_once_with(
+                self.vg, self.lv, self.helper.test_size, sparse=True)
+
+            # We should be writing direct to an LVM disk
+            self.assertEqual(self.lv_path, import_path)
+
+        self.helper.assert_disk_locked(disk, False)
+
+    def test_import_file_qcow2(self):
+        # Test that importing a qcow2 file will convert it to raw
+        disk = imagebackend.Lvm(instance=self.instance,
+                                disk_name=self.disk_name)
+
+        # Assert ordering: lvm_create before image_convert
+        self.helper.mock_image_convert.side_effect = lambda *args, **kwargs: \
+            self.helper.mock_lvm_create.assert_called_once_with(
+                    self.vg, self.lv, self.helper.test_size, sparse=False)
+
+        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_QCOW2,
+                              self.helper.test_size) as import_path:
+            self.helper.assert_disk_locked(disk)
+            self.helper.assert_size_and_format(import_path,
+                                               imgmodel.FORMAT_QCOW2)
+
+        self.helper.assert_disk_locked(disk, False)
+
+        self.helper.mock_image_convert.assert_called_once_with(
+            import_path, self.lv_path,
+            imgmodel.FORMAT_QCOW2, imgmodel.FORMAT_RAW, run_as_root=True)
+
+    def test_import_file_cleanup_on_error(self):
+        # Test that the lvm device will be cleaned up automatically if
+        # there's an error during import
+        disk = imagebackend.Lvm(instance=self.instance,
+                                disk_name=self.disk_name)
+
+        class FakeException(Exception):
+            pass
+
+        # Assert ordering (lvm_create before lvm_remove)
+        self.helper.mock_lvm_remove.side_effect = lambda *args, **kwargs: \
+            self.helper.mock_lvm_create.assert_called_once_with(
+                    self.vg, self.lv, self.helper.test_size, sparse=False)
+
+        try:
+            with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                                  self.helper.test_size):
+                raise FakeException()
+        except FakeException:
+            pass
+
+        self.helper.mock_lvm_remove.assert_called_once_with([self.lv_path])
+
+    def test_encrypted_import_file_cleanup_on_error(self):
+        # Test that the dmcrypt device will be cleaned up automatically if
+        # there's an error during import
+        self.configure_encryption()
+
+        disk = imagebackend.Lvm(instance=self.instance,
+                                disk_name=self.disk_name)
+
+        class FakeException(Exception):
+            pass
+
+        # Assert ordering (dmcrypt_delete before lvm_remove)
+        self.helper.mock_lvm_remove.side_effect = lambda *args, **kwargs: \
+            self.helper.mock_dmcrypt_remove.assert_called_once_with(
+                self.dmcrypt_name)
+
+        # Assert ordering (lvm_create before lvm_remove)
+        self.helper.mock_lvm_remove.side_effect = lambda *args, **kwargs: \
+            self.helper.mock_lvm_create.assert_called_once_with(
+                    self.vg, self.lv, self.helper.test_size, sparse=False)
+
+        try:
+            with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
+                                  self.helper.test_size):
+                raise FakeException()
+        except FakeException:
+            pass
+
+        self.helper.mock_lvm_remove.assert_called_once_with([self.lv_path])
 
 
 class RbdTestCase(_ImageTestCase, test.NoDBTestCase):

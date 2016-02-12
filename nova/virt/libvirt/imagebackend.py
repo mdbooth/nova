@@ -399,7 +399,7 @@ class Image(object):
         raise NotImplementedError()
 
     def check_backing_from_image(self, context, image_id, instance,
-                                 size=None, fallback_from_host=None):
+                                 fallback_from_host=None):
         pass
 
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
@@ -868,6 +868,79 @@ class Qcow2(Image):
         cache_name = os.path.basename(backing_path)
         cache_pool.get_cached_func(func, cache_name,
                                    fallback_from_host=fallback_from_host)
+
+    def create_from_image(self, context, image_id, instance, size,
+                          fallback_from_host=None):
+        # Get the image from the local image cache, downloading if necessary.
+        imagecache_pool = ImageCacheLocalPool.get()
+        cached_image = imagecache_pool.get_cached_image(
+                context, image_id, instance,
+                fallback_from_host=fallback_from_host)
+
+        # Ensure that the disk is big enough for the image
+        self.verify_base_size(None, size, cached_image.virtual_size)
+
+        with fileutils.remove_path_on_error(self.path):
+            # TODO(pbrady): Consider copying the cow image here
+            # with preallocation=metadata set for performance reasons.
+            # This would be keyed on a 'preallocate_images' setting.
+
+            # TODO(mdbooth): We have the backing file format here,
+            # now. We should pass it explicitly.
+            libvirt_utils.create_cow_image(cached_image.path, self.path)
+            if size:
+                image = imgmodel.LocalFileImage(self.path,
+                                                imgmodel.FORMAT_QCOW2)
+                disk.extend(image, size)
+
+    def check_backing_from_image(self, context, image_id, instance,
+                                 fallback_from_host=None):
+        backing_path = libvirt_utils.get_disk_backing_file(self.path)
+        if backing_path is None or os.path.exists(backing_path):
+            return
+
+        # Backing file is missing. Fetch the image.
+        imagecache_pool = ImageCacheLocalPool.get()
+        cached_image = imagecache_pool.get_cached_image(
+                context, image_id, instance,
+                fallback_from_host=fallback_from_host)
+
+        # Check if that was it
+        if cached_image.path == backing_path:
+            return
+
+        self._check_pre_grizzly(backing_path, cached_image)
+        # NOTE(mdbooth): We don't raise an exception here. That doesn't seem
+        # like a good idea.
+
+    @staticmethod
+    def _check_pre_grizzly(backing_path, cached_image):
+        # Determine whether an existing qcow2 disk uses a legacy backing by
+        # actually looking at the image itself and parsing the output of the
+        # backing file it expects to be using.
+        # See https://bugs.launchpad.net/nova/+bug/1185588
+
+        # If this is a pre-Grizzly backing file, we expect the path to be:
+        #   /path/to/cache/image_4
+        backing_parts = backing_path.rpartition('_')
+
+        # File prefix should be the cache image (/path/to/cache/image)
+        if backing_parts[0] != cached_image.path:
+            return
+
+        # Suffix should be the image size (4)
+        backing_size = backing_parts[-1]
+        if not backing_size.isdigit():
+            return
+
+        # We have a legacy backing file
+        backing_size = int(backing_size) * units.Gi
+
+        with fileutils.remove_path_on_error(backing_path):
+            libvirt_utils.copy_image(cached_image.path, backing_path)
+            image = imgmodel.LocalFileImage(backing_path,
+                                            imgmodel.FORMAT_QCOW2)
+            disk.extend(image, backing_size)
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = self._get_lock_name(base)

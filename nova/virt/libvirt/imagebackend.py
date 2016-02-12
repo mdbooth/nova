@@ -1647,6 +1647,34 @@ class Ploop(Image):
                 import_path:
             libvirt_utils.copy_image(cached, import_path)
 
+    def create_from_image(self, context, image_id, instance, size,
+                          fallback_from_host=None):
+        if CONF.force_raw_images:
+            pcs_format = "raw"
+        else:
+            image_meta = IMAGE_API.get(context, image_id)
+            format = image_meta.get("disk_format")
+            if format == "ploop":
+                pcs_format = "expanded"
+            elif format == "raw":
+                pcs_format = "raw"
+            else:
+                reason = _("PCS doesn't support images in %s format."
+                           " You should either set force_raw_images=True"
+                           " in config or upload an image in ploop"
+                           " or raw format.") % format
+                raise exception.ImageUnacceptable(
+                    image_id=image_id, reason=reason)
+
+        imagecache_pool = ImageCacheLocalPool.get()
+        cached_image = imagecache_pool.get_cached_image(
+            context, image_id, instance,
+            fallback_from_host=fallback_from_host)
+        self.verify_base_size(None, size, cached_image.virtual_size)
+
+        with self.import_file(context, pcs_format, size) as target:
+            libvirt_utils.copy_image(cached_image.path, target)
+
     def snapshot_extract(self, target, out_format):
         img_path = os.path.join(self.path, "root.hds")
         libvirt_utils.extract_snapshot(img_path,

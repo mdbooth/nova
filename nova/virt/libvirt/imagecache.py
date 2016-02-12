@@ -19,7 +19,7 @@ The cache manager implements the specification at
 http://wiki.openstack.org/nova-image-cache-management.
 
 """
-
+import collections
 import hashlib
 import os
 import re
@@ -28,13 +28,16 @@ import time
 from oslo_concurrency import lockutils
 from oslo_concurrency import processutils
 from oslo_log import log as logging
+from oslo_utils import fileutils
 
 import nova.conf
+from nova import exception
 from nova.i18n import _LE
 from nova.i18n import _LI
 from nova.i18n import _LW
 from nova import utils
 from nova.virt import imagecache
+from nova.virt import images
 from nova.virt.libvirt import utils as libvirt_utils
 
 LOG = logging.getLogger(__name__)
@@ -80,10 +83,22 @@ def is_valid_info_file(path):
     return False
 
 
+def lock_path():
+    return os.path.join(CONF.instances_path, 'locks')
+
+
+def locked_cache_entry(name):
+    return utils.synchronized(name, external=True, lock_path=lock_path())
+
+
+def delete_lock_file(name):
+    lockutils.remove_external_lock_file(name,
+        lock_file_prefix='nova-', lock_path=lock_path())
+
+
 class ImageCacheManager(imagecache.ImageCacheManager):
     def __init__(self):
         super(ImageCacheManager, self).__init__()
-        self.lock_path = os.path.join(CONF.instances_path, 'locks')
         self._reset_state()
 
     def _reset_state(self):
@@ -244,8 +259,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
 
         lock_file = os.path.split(base_file)[-1]
 
-        @utils.synchronized(lock_file, external=True,
-                            lock_path=self.lock_path)
+        @locked_cache_entry(lock_file)
         def _inner_remove_old_enough_file():
             # NOTE(mikal): recheck that the file is old enough, as a new
             # user of the file might have come along while we were waiting
@@ -284,13 +298,25 @@ class ImageCacheManager(imagecache.ImageCacheManager):
             _inner_remove_old_enough_file()
             if remove_lock:
                 try:
-                    # NOTE(jichenjc) The lock file will be constructed first
-                    # time the image file was accessed. the lock file looks
-                    # like nova-9e881789030568a317fad9daae82c5b1c65e0d4a
-                    # or nova-03d8e206-6500-4d91-b47d-ee74897f9b4e
-                    # according to the original file name
-                    lockutils.remove_external_lock_file(lock_file,
-                        lock_file_prefix='nova-', lock_path=self.lock_path)
+                    # NOTE(mdbooth): This is a bug. Consider the following
+                    # scenario:
+                    #
+                    # Thread A          Thread B        Thread C
+                    # Get lock X        Get lock X
+                    # Delete lock X
+                    # Release lock X
+                    #                   Obtain lock X   Get lock X'
+                    #                   Download        Download
+                    #
+                    # Note that because we deleted the lock file thread B
+                    # obtains a lock on the now-deleted file, and thread C
+                    # obtains a different lock on a newly created lock file.
+                    # Both have a lock simultaneously, and both download to
+                    # the same destination simultaneously, creating a
+                    # corrupt downloaded image.
+                    #
+                    # TODO(mdbooth): fix this bug
+                    delete_lock_file(lock_file)
                 except OSError as e:
                     LOG.debug('Failed to remove %(lock_file)s, '
                               'error was %(error)s',
@@ -456,3 +482,155 @@ class ImageCacheManager(imagecache.ImageCacheManager):
         # perform the aging and image verification
         self._age_and_verify_cached_images(context, all_instances, base_dir)
         self._age_and_verify_swap_images(context, base_dir)
+
+
+CachedImageInfo = collections.namedtuple(
+    'CachedImageInfo', ('path', 'file_format', 'virtual_size', 'disk_size'))
+
+
+class ImageCacheLocalDir(object):
+    """Cache glance images or template function output in a directory local
+    to the compute host. This class provides an interface to write to and
+    retrieve from the cache managed by ImageCacheManager.
+    """
+
+    # NOTE(mdbooth): Ideally the functionality of ImageCacheManager will
+    # be folded into this class as it is cleaned up. For the moment, this is
+    # the code which was distributed through other modules for interoperating
+    # compatibly with ImageCacheManager.
+
+    _singleton = None
+
+    @classmethod
+    def get(cls):
+        """Get the ImageCacheLocalDir singleton.
+
+        Returns:
+            ImageCacheLocalDir: ImageCacheLocalDir singleton
+        """
+        if cls._singleton is not None:
+            return cls._singleton
+
+        with lockutils.lock('libvirt.imagebackend.imagecache_local_pool'):
+            if cls._singleton is None:
+                cls._singleton = ImageCacheLocalDir()
+            return cls._singleton
+
+    def __init__(self):
+        self.lock_path = os.path.join(CONF.instances_path, 'locks')
+        self.base_dir = os.path.join(CONF.instances_path,
+                                     CONF.image_cache_subdirectory_name)
+        if not os.path.exists(self.base_dir):
+            fileutils.ensure_tree(self.base_dir)
+
+    def is_path_in_image_cache(self, path):
+        return os.path.dirname(path) == self.base_dir
+
+    @staticmethod
+    def _check_exists_and_mark_in_use(path):
+        if os.path.exists(path):
+            # NOTE(mikal): Update the mtime of the base file so the image
+            # cache manager knows it is in use.
+            libvirt_utils.update_mtime(path)
+            return True
+
+        return False
+
+    def get_image_info(self, context, image_id, fallback=None):
+        """Fetch an image from the cache, side-loading it from
+        `fallback_from_host` if it isn't in glance.
+
+        Args:
+            context: The current RequestContext.
+            image_id: The image_id of the image to be fetched.
+            fallback: A compute host to side-load the image from
+                    if it is no longer in glance.
+
+        Returns:
+            CachedImageInfo: Metadata describing the cached image.
+        """
+        name = get_cache_fname(image_id)
+        path = os.path.join(self.base_dir, name)
+
+        @locked_cache_entry(name)
+        def _sync():
+            if self._check_exists_and_mark_in_use(path):
+                return
+
+            try:
+                libvirt_utils.fetch_image(context, path, image_id)
+            except exception.ImageNotFound:
+                if fallback is None:
+                    raise
+
+                LOG.debug("Image %(image_id)s no longer exists in the image "
+                          "service. Attempting to copy it from %(host)s",
+                          {'image_id': image_id, 'host': fallback})
+
+                libvirt_utils.copy_image(src=path, dest=path,
+                                         host=fallback,
+                                         receive=True)
+
+        _sync()
+
+        # NOTE: We should persist this information somehow and return it
+        # securely, because image inspection here isn't ideal. The image was
+        # sanity checked in fetch_image when it was downloaded, so this
+        # isn't the worst, but we could do better. Until then, this is
+        # equivalent to what we have done before.
+        info = images.qemu_img_info(path)
+        return CachedImageInfo(path, info.file_format, info.virtual_size,
+                               info.disk_size)
+
+    def get_func_output_path(self, func, name, fallback=None):
+        """Get the cached output of a function from the cache. If it
+        don't exist, try to side-load it from another compute host.
+        Failing that, generate it again locally.
+        Args:
+            func: A function, taking a path as an argument, which will write
+                data to path
+            name: The name of the function output, used to reference cached
+                output.
+            fallback: A compute host to side-load the output from.
+        Returns:
+            str: The path of the cached output.
+        """
+        path = os.path.join(self.base_dir, name)
+
+        @locked_cache_entry(name)
+        def _sync():
+            if self._check_exists_and_mark_in_use(path):
+                return
+
+            created = False
+            if fallback is not None:
+                try:
+                    # Ideally we'll get the original backing file from the
+                    # source host. The reason we prefer this is that if we
+                    # have to generate a new one, or if the output already
+                    # existed in our own cache from a previous run,
+                    # for that matter, the output is guaranteed to be
+                    # different. This is a bug which results in (hopefully
+                    # only) subtle data corruption.
+
+                    LOG.debug("Disk template %(name)s doesn't exist in the "
+                              "image cache, attempting to copy it from "
+                              "%(host)s",
+                              {'name': name, 'host': fallback})
+
+                    libvirt_utils.copy_image(src=path, dest=path,
+                                             host=fallback,
+                                             receive=True)
+                    created = True
+                except processutils.ProcessExecutionError:
+                    LOG.exception(_LW('Failed to side-load %(path)s from '
+                                      '%(host)s'),
+                                  {'path': path, 'host': fallback})
+
+            # Generate a new one as a last resort
+            if not created:
+                func(path)
+
+        _sync()
+
+        return path

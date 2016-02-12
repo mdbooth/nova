@@ -15,12 +15,14 @@
 
 import abc
 import base64
+import collections
 import contextlib
 import functools
 import os
 import shutil
 
 from oslo_concurrency import lockutils
+from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -41,6 +43,7 @@ from nova.virt.disk import api as disk
 from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import imagecache
 from nova.virt.libvirt.storage import dmcrypt
 from nova.virt.libvirt.storage import lvm
 from nova.virt.libvirt.storage import rbd_utils
@@ -81,6 +84,152 @@ CONF.import_opt('rbd_secret_uuid', 'nova.virt.libvirt.volume.net',
 
 LOG = logging.getLogger(__name__)
 IMAGE_API = image.API()
+
+
+CachedImageInfo = collections.namedtuple(
+    'CachedImageInfo', ('path', 'file_format', 'virtual_size', 'disk_size'))
+
+
+class ImageCacheLocalPool(object):
+    _singleton = None
+
+    @classmethod
+    def reset(cls):
+        """Throw away the initialised singleton. Useful for testing."""
+        cls._singleton = None
+
+    @classmethod
+    def get(cls):
+        """Get the ImageCacheLocalPool singleton.
+
+        Returns:
+            ImageCacheLocalPool: ImageCacheLocalPool singleton
+        """
+        if cls._singleton is not None:
+            return cls._singleton
+
+        with lockutils.lock('libvirt.imagebackend.imagecache_local_pool'):
+            if cls._singleton is None:
+                cls._singleton = ImageCacheLocalPool()
+            return cls._singleton
+
+    def __init__(self):
+        self.lock_path = os.path.join(CONF.instances_path, 'locks')
+        self.base_dir = os.path.join(CONF.instances_path,
+                                     CONF.image_cache_subdirectory_name)
+        if not os.path.exists(self.base_dir):
+            fileutils.ensure_tree(self.base_dir)
+
+    def is_path_in_image_cache(self, path):
+        return os.path.dirname(path) == self.base_dir
+
+    @staticmethod
+    def check_exists_and_mark_in_use(path):
+        if os.path.exists(path):
+            # NOTE(mikal): Update the mtime of the base file so the image
+            # cache manager knows it is in use.
+            libvirt_utils.update_mtime(path)
+            return True
+
+        return False
+
+    def get_cached_image(self, context, image_id, instance,
+                         fallback_from_host=None):
+        """Fetch an image from the cache, side-loading it from
+        `fallback_from_host` if it isn't in glance.
+
+        Args:
+            context: The current RequestContext.
+            image_id: The image_id of the image to be fetched.
+            instance: An instance we are fetching the image for. Used only
+                    for user_id and project_id.
+            fallback_from_host: A compute host to side-load the image from
+                    if it is no longer in glance.
+
+        Returns:
+            CachedImageInfo: Metadata describing the cached image.
+        """
+        name = imagecache.get_cache_fname(image_id)
+        path = os.path.join(self.base_dir, name)
+
+        @utils.synchronized(name, external=True, lock_path=self.lock_path)
+        def _sync():
+            if self.check_exists_and_mark_in_use(path):
+                return
+
+            try:
+                libvirt_utils.fetch_image(context, path, image_id,
+                    instance.user_id, instance.project_id)
+            except exception.ImageNotFound:
+                if fallback_from_host is None:
+                    raise
+
+                LOG.debug("Image %(image_id)s doesn't exist anymore "
+                          "on image service, attempting to copy "
+                          "image from %(host)s",
+                          {'image_id': image_id, 'host': fallback_from_host},
+                          instance=instance)
+
+                libvirt_utils.copy_image(src=path, dest=path,
+                                         host=fallback_from_host,
+                                         receive=True)
+
+        _sync()
+
+        # NOTE: We should persist this information somehow and return it
+        # securely, because image inspection here isn't ideal. The image was
+        # sanity checked in fetch_image when it was downloaded, so this
+        # isn't the worst, but we could do better. Until then, this is
+        # equivalent to what we have done before.
+        info = images.qemu_img_info(path)
+        return CachedImageInfo(path, info.file_format, info.virtual_size,
+                               info.disk_size)
+
+    def get_cached_func(self, func, name, fallback_from_host=None):
+        """Get the cached output of a function from the cache. If it
+        don't exist, try to side-load it from another compute host.
+        Failing that, generate it again locally.
+        Args:
+            func: A function, taking a path as an argument, which will write
+                data to path
+            name: The name of the file in the cache.
+            fallback_from_host: A compute host to side-load the output from.
+        Returns:
+            str: The path of the cached output.
+        """
+        path = os.path.join(self.base_dir, name)
+
+        @utils.synchronized(name, external=True, lock_path=self.lock_path)
+        def _sync():
+            if self.check_exists_and_mark_in_use(path):
+                return
+
+            created = False
+            if fallback_from_host is not None:
+                try:
+                    # Ideally we'll get the original backing file from the
+                    # source host. The reason we prefer this is that if we
+                    # have to generate a new one, or if the output already
+                    # existed in our own cache from a previous run,
+                    # for that matter, the output is guaranteed to be
+                    # different. This is a bug which results in (hopefully
+                    # only) subtle data corruption.
+                    libvirt_utils.copy_image(src=path, dest=path,
+                                             host=fallback_from_host,
+                                             receive=True)
+                    created = True
+                except processutils.ProcessExecutionError:
+                    LOG.exception(_LW('Failed to side-load %(path)s from '
+                                      '%(host)s'),
+                                  {'path': path, 'host': fallback_from_host})
+
+            # Generate a new one as a last resort
+            if not created:
+                func(path)
+
+        _sync()
+
+        return path
 
 
 @six.add_metaclass(abc.ABCMeta)

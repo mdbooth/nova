@@ -1130,6 +1130,25 @@ class Lvm(Image):
         with self.import_file(context, imgmodel.FORMAT_RAW, size) as target:
             func(target)
 
+    def create_from_image(self, context, image_id, instance, size,
+                          fallback_from_host=None):
+        # Get the image from the local image cache, downloading if
+        # necessary.
+        imagecache_pool = ImageCacheLocalPool.get()
+        cached_image = imagecache_pool.get_cached_image(
+            context, image_id, instance,
+            fallback_from_host=fallback_from_host)
+        self.verify_base_size(None, size, cached_image.virtual_size)
+
+        with self.import_file(context, cached_image.file_format, size) \
+                as target:
+            images.convert_image(cached_image.path, target,
+                                 cached_image.file_format,
+                                 self.driver_format,
+                                 run_as_root=True)
+            if size > cached_image.virtual_size:
+                disk.resize2fs(target, run_as_root=True)
+
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         def encrypt_lvm_image():
             dmcrypt.create_volume(self.path.rpartition('/')[2],

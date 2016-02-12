@@ -9350,6 +9350,13 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def __init__(self, instance, name, is_block_dev=False):
                     self.path = os.path.join(instance['name'], name)
                     self.is_block_dev = is_block_dev
+                    self.locked = False
+
+                @contextlib.contextmanager
+                def lock(self):
+                    self.locked = True
+                    yield
+                    self.locked = False
 
                 def create_image(self, prepare_template, base,
                                  size, *args, **kwargs):
@@ -9450,6 +9457,13 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def __init__(self, instance, name, is_block_dev=False):
                     self.path = os.path.join(instance['name'], name)
                     self.is_block_dev = is_block_dev
+                    self.locked = False
+
+                @contextlib.contextmanager
+                def lock(self):
+                    self.locked = True
+                    yield
+                    self.locked = False
 
                 def create_image(self, prepare_template, base,
                                  size, *args, **kwargs):
@@ -9518,6 +9532,13 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def __init__(self, instance, name, is_block_dev=False):
                     self.path = os.path.join(instance['name'], name)
                     self.is_block_dev = is_block_dev
+                    self.locked = False
+
+                @contextlib.contextmanager
+                def lock(self):
+                    self.locked = True
+                    yield
+                    self.locked = False
 
                 def create_image(self, prepare_template, base,
                                  size, *args, **kwargs):
@@ -9660,9 +9681,14 @@ class LibvirtConnTestCase(test.NoDBTestCase):
 
     @mock.patch.object(nova.virt.libvirt.imagebackend.Image, 'cache')
     def test_create_image_resize_snap_backend(self, mock_cache):
+        @contextlib.contextmanager
+        def fake_lock():
+            yield
+
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
         drvr.image_backend = mock.Mock()
         drvr.image_backend.image.return_value = drvr.image_backend
+        drvr.image_backend.lock = fake_lock
         instance = objects.Instance(**self.test_instance)
         instance.task_state = task_states.RESIZE_FINISH
         image_meta = objects.ImageMeta.from_dict(self.test_image_meta)

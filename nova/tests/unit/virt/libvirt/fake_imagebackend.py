@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextlib
 import os
 
 from nova.virt.libvirt import config
@@ -27,6 +28,13 @@ class Backend(object):
         class FakeImage(imagebackend.Image):
             def __init__(self, instance, name):
                 self.path = os.path.join(instance['name'], name)
+                self.locked = False
+
+            @contextlib.contextmanager
+            def lock(self):
+                self.locked = True
+                yield
+                self.locked = False
 
             def create_image(self, prepare_template, base,
                               size, *args, **kwargs):

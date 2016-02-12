@@ -16,6 +16,7 @@
 
 import contextlib
 import os
+import six
 import time
 
 import mock
@@ -23,16 +24,20 @@ from oslo_concurrency import lockutils
 from oslo_concurrency import processutils
 from oslo_log import formatters
 from oslo_log import log as logging
+from oslo_utils import fileutils
 from oslo_utils import importutils
+from oslo_utils import uuidutils
 from six.moves import cStringIO
 
 from nova import conductor
 import nova.conf
 from nova import context
+from nova import exception
 from nova import objects
 from nova import test
 from nova.tests.unit import fake_instance
 from nova import utils
+from nova.virt import images
 from nova.virt.libvirt import imagecache
 from nova.virt.libvirt import utils as libvirt_utils
 
@@ -773,3 +778,260 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
                                                     remove_lock=False)
         mock_synchronized.assert_called_once_with(lock_file, external=True,
                                                   lock_path=lock_path)
+
+
+class ImageCacheLocalDirTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(ImageCacheLocalDirTestCase, self).setUp()
+
+        # Ensure we get a new singleton with each test run
+        imagecache.ImageCacheLocalDir._singleton = None
+
+        self.image_id = 'e557355c-19e9-4749-837a-87a222610fea'
+        self.image_hash = '87ee9ef6f36612843bc8e61eb4ab6a1593380891'
+
+        self.instances_path = '/instances'
+        self.default_lock_path = os.path.join(self.instances_path, 'locks')
+        self.default_cache_dir = os.path.join(self.instances_path, '_base')
+
+        self.expected_image_path = os.path.join(self.default_cache_dir,
+                                                self.image_hash)
+
+        self.func_name = 'swap_128'
+        self.expected_func_path = os.path.join(self.default_cache_dir,
+                                               self.func_name)
+
+        self.flags(instances_path=self.instances_path)
+
+        self.locked = False
+
+        # True if the default cache dir exists. We needn't be locked to test
+        # this.
+        self.cache_dir_exists = True
+        # The set of paths which exist. We must be locked to test these.
+        self.existing_paths = set()
+
+    def fake_synchronized(self, fn):
+        # A fake synchronized method which toggles the locked property while
+        # held. We can check this field in tests to assert we are holding
+        # the lock during operations.
+        @six.wraps(fn)
+        def wrapper(*args, **kwargs):
+            self.locked = True
+            fn(*args, **kwargs)
+            self.locked = False
+
+        return wrapper
+
+    def assert_in_lock(self, *args, **kwargs):
+        self.assertTrue(self.locked)
+        return mock.DEFAULT
+
+    def fake_exists(self, path):
+        # Don't need to be locked when testing the cache directory
+        if path == self.default_cache_dir:
+            return self.cache_dir_exists
+
+        # Should be locked when testing anything else
+        self.assert_in_lock()
+        return path in self.existing_paths
+
+    @contextlib.contextmanager
+    def default_mocks(self):
+        with mock.patch.object(utils, 'synchronized', autospec=True,
+                               return_value=self.fake_synchronized) \
+                as self.mock_synchronized, \
+                mock.patch.object(os.path, 'exists', autospec=True,
+                                  side_effect=self.fake_exists) \
+                        as self.mock_exists, \
+                mock.patch.object(images, 'qemu_img_info', autospec=True) \
+                        as self.mock_qemu_img_info:
+            yield
+
+    def assert_qemu_img_info(self, result):
+        # Check that result corresponds to the return of qemu_img_info
+        self.mock_qemu_img_info.assert_called_once_with(
+            self.expected_image_path)
+        self.assertEqual(self.expected_image_path, result.path)
+        self.assertIs(self.mock_qemu_img_info.return_value.file_format,
+                      result.file_format)
+        self.assertIs(self.mock_qemu_img_info.return_value.virtual_size,
+                      result.virtual_size)
+        self.assertIs(self.mock_qemu_img_info.return_value.disk_size,
+                      result.disk_size)
+
+    def test_singleton(self):
+        # Multiple calls to ImageCacheLocalDir.get() should return the same
+        # object
+        with self.default_mocks():
+            cache1 = imagecache.ImageCacheLocalDir.get()
+            cache2 = imagecache.ImageCacheLocalDir.get()
+
+        self.assertIs(cache1, cache2)
+
+    @mock.patch.object(fileutils, 'ensure_tree', autospec=True)
+    def test_create_cache_dir(self, mock_ensure_tree):
+        # Creating a pool should create the cache directory if it doesn't exist
+        self.cache_dir_exists = False
+
+        with self.default_mocks():
+            imagecache.ImageCacheLocalDir.get()
+
+        mock_ensure_tree.assert_called_once_with(self.default_cache_dir)
+
+    @mock.patch.object(libvirt_utils, 'update_mtime', autospec=True)
+    def test_get_image_info_exists(self, mock_update_mtime):
+        # Calling get_image_info when the image exists should return the
+        # existing image without fetching it.
+
+        # Image path already exists
+        self.existing_paths.add(self.expected_image_path)
+
+        with self.default_mocks():
+            pool = imagecache.ImageCacheLocalDir.get()
+
+            result = pool.get_image_info(mock.sentinel.context,
+                                         self.image_id)
+        self.assert_qemu_img_info(result)
+
+        mock_update_mtime.assert_called_once_with(self.expected_image_path)
+
+        self.mock_synchronized.assert_called_once_with(
+            self.image_hash, external=True,
+            lock_path=self.default_lock_path)
+
+    @mock.patch.object(libvirt_utils, 'fetch_image', autospec=True)
+    def test_get_image_info_not_exists(self, mock_fetch_image):
+        # Calling get_image_info when the image does not exist locally should
+        # fetch the image before returning it.
+
+        # Assert that we're locked when fetching the image
+        mock_fetch_image.side_effect = self.assert_in_lock
+
+        with self.default_mocks():
+            pool = imagecache.ImageCacheLocalDir.get()
+
+            result = pool.get_image_info(mock.sentinel.context,
+                                         self.image_id)
+        self.assert_qemu_img_info(result)
+
+        self.mock_synchronized.assert_called_once_with(
+            self.image_hash, external=True,
+            lock_path=self.default_lock_path)
+
+        mock_fetch_image.assert_called_once_with(
+            mock.sentinel.context, self.expected_image_path, self.image_id)
+
+    @mock.patch.object(libvirt_utils, 'fetch_image', autospec=True)
+    def test_get_image_info_not_exists_no_fallback(self, mock_fetch_image):
+        # Calling get_image_info when the image does not exist
+        # locally, it is not available from glance, and no fallback is given
+        # should raise ImageNotFound
+        mock_fetch_image.side_effect = exception.ImageNotFound(
+            image_id=self.image_id)
+
+        with self.default_mocks():
+            pool = imagecache.ImageCacheLocalDir.get()
+
+            self.assertRaises(exception.ImageNotFound, pool.get_image_info,
+                              mock.sentinel.context, self.image_id)
+
+        self.mock_synchronized.assert_called_once_with(
+            self.image_hash, external=True,
+            lock_path=self.default_lock_path)
+
+        mock_fetch_image.assert_called_once_with(
+            mock.sentinel.context, self.expected_image_path, self.image_id)
+
+    @mock.patch.object(libvirt_utils, 'copy_image', autospec=True)
+    @mock.patch.object(libvirt_utils, 'fetch_image', autospec=True)
+    def test_get_image_info_not_exists_fallback(self, mock_fetch_image,
+                                                  mock_copy_image):
+        # Calling get_image_info when the image does not exist
+        # locally and it is not available from glance should fallback to
+        # copying from a remote host if one was given.
+        mock_fetch_image.side_effect = exception.ImageNotFound(
+            image_id=self.image_id)
+
+        with self.default_mocks():
+            pool = imagecache.ImageCacheLocalDir.get()
+
+            result = pool.get_image_info(mock.sentinel.context,
+                                         self.image_id,
+                                         fallback_from_host='host')
+        self.assert_qemu_img_info(result)
+
+        self.mock_synchronized.assert_called_once_with(
+            self.image_hash, external=True,
+            lock_path=self.default_lock_path)
+
+        mock_fetch_image.assert_called_once_with(
+            mock.sentinel.context, self.expected_image_path, self.image_id)
+        mock_copy_image.assert_called_once_with(src=self.expected_image_path,
+                                                dest=self.expected_image_path,
+                                                host='host',
+                                                receive=True)
+
+    @mock.patch.object(libvirt_utils, 'update_mtime', autospec=True)
+    def test_get_func_output_path_exists(self, mock_update_mtime):
+        # Calling get_func_output_path when the file exists should update its
+        # mtime and not raise any exceptions
+        fallback_host = uuidutils.generate_uuid()
+        self.existing_paths.add(self.expected_func_path)
+
+        mock_create = mock.Mock()
+
+        with self.default_mocks():
+            pool = imagecache.ImageCacheLocalDir.get()
+            pool.get_func_output_path(mock_create, self.func_name,
+                                      fallback_from_host=fallback_host)
+
+        self.mock_exists.assert_any_call(self.expected_func_path)
+        mock_update_mtime.assert_called_once_with(self.expected_func_path)
+        self.assertFalse(mock_create.called)
+
+    @mock.patch.object(libvirt_utils, 'copy_image', autospec=True)
+    def test_get_func_output_path_not_exists(self, mock_copy_image):
+        # Calling get_func_output_path when the file does not exist should
+        # attempt to retrieve it from the fallback host
+
+        # We should be locked while copying the image
+        mock_copy_image.side_effect = \
+            lambda *args, **kwargs: self.assertTrue(self.locked)
+
+        mock_create = mock.Mock()
+
+        with self.default_mocks():
+            pool = imagecache.ImageCacheLocalDir.get()
+            pool.get_func_output_path(
+                mock_create, self.func_name,
+                fallback_from_host=mock.sentinel.fallback)
+
+        self.mock_exists.assert_any_call(self.expected_func_path)
+        mock_copy_image.assert_called_once_with(src=self.expected_func_path,
+                                                dest=self.expected_func_path,
+                                                host=mock.sentinel.fallback,
+                                                receive=True)
+        self.assertFalse(mock_create.called)
+
+    @mock.patch.object(libvirt_utils, 'copy_image', autospec=True)
+    def test_get_func_output_path_not_exists_no_fallback(self,
+                                                         mock_copy_image):
+        # Calling get_func_output_path when the file does not exist should
+        # attempt to retrieve it from the fallback host
+
+        mock_copy_image.side_effect = processutils.ProcessExecutionError
+        mock_create = mock.Mock()
+
+        with self.default_mocks():
+            cache = imagecache.ImageCacheLocalDir.get()
+            cache.get_func_output_path(
+                mock_create, self.func_name,
+                fallback_from_host=mock.sentinel.fallback)
+
+        self.mock_exists.assert_any_call(self.expected_func_path)
+        mock_copy_image.assert_called_once_with(src=self.expected_func_path,
+                                                dest=self.expected_func_path,
+                                                host=mock.sentinel.fallback,
+                                                receive=True)
+        mock_create.assert_called_once_with(self.expected_func_path)

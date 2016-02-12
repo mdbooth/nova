@@ -394,6 +394,14 @@ class Image(object):
                                 fallback_from_host=None):
         pass
 
+    def create_from_image(self, context, image_id, instance, size=None,
+                          fallback_from_host=None):
+        raise NotImplementedError()
+
+    def check_backing_from_image(self, context, image_id, instance,
+                                 size=None, fallback_from_host=None):
+        pass
+
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
         """Creates image from template.
 
@@ -761,6 +769,26 @@ class NoBacking(Image):
                                         fallback_from_host=fallback_from_host)
         with self.import_file(context, imgmodel.FORMAT_RAW, size) as target:
             libvirt_utils.copy_image(backing, target)
+
+    def create_from_image(self, context, image_id, instance, size,
+                          fallback_from_host=None):
+        # Get the image from the local image cache, downloading if necessary.
+        imagecache_pool = ImageCacheLocalPool.get()
+        cached_image = imagecache_pool.get_cached_image(
+                context, image_id, instance,
+                fallback_from_host=fallback_from_host)
+
+        # Ensure that the disk is big enough for the image
+        self.verify_base_size(None, size, cached_image.virtual_size)
+
+        with self.import_file(context, imgmodel.FORMAT_RAW, size) as target:
+            # Copy the cached image
+            libvirt_utils.copy_image(cached_image.path, target)
+
+            # Resize the disk if required
+            if size > 0:
+                image = imgmodel.LocalFileImage(target, self.driver_format)
+                disk.extend(image, size)
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = self._get_lock_name(base)

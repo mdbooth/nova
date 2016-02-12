@@ -1315,6 +1315,15 @@ class Rbd(Image):
     def exists(self):
         return self.driver.exists(self.rbd_name)
 
+    @contextlib.contextmanager
+    def remove_volume_on_error(self):
+        try:
+            yield
+        except Exception:
+            with excutils.save_and_reraise_exception(), self.lock():
+                if self.exists():
+                    self.driver.remove_image(self.rbd_name)
+
     def get_disk_size(self, name):
         """Returns the size of the virtual disk in bytes.
 
@@ -1415,6 +1424,38 @@ class Rbd(Image):
                                        fallback_from_host=fallback_from_host)
         with self.lock():
             self.driver.import_image(cached, self.rbd_name)
+
+    def create_from_image(self, context, image_id, instance, size,
+                          fallback_from_host=None):
+        image_meta = IMAGE_API.get(context, image_id, include_locations=True)
+        locations = image_meta['locations']
+
+        # Look for a cloneable glance location
+        for location in locations:
+            if self.driver.is_cloneable(location, image_meta):
+                with self.remove_volume_on_error():
+                    with self.lock():
+                        self.driver.clone(location, self.rbd_name)
+
+                    # Check the size of the cloned disk.
+                    # TODO(mdbooth): It would be better to check this before
+                    # cloning the disk, but we'd need some additional
+                    # methods in rbd_utils.
+                    disk_size = self.driver.size(self.rbd_name)
+                    self.verify_base_size(None, size, disk_size)
+                    break
+
+        # We didn't find a cloneable glance location, so download to the
+        # local image cache and import it.
+        else:
+            imagecache_pool = ImageCacheLocalPool.get()
+            cached_image = imagecache_pool.get_cached_image(
+                context, image_id, instance,
+                fallback_from_host=fallback_from_host)
+            self.verify_base_size(None, size, cached_image.virtual_size)
+
+            with self.lock():
+                self.driver.import_image(cached_image.path, self.rbd_name)
 
     def create_snap(self, name):
         return self.driver.create_snap(self.rbd_name, name)

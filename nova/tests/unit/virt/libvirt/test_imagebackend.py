@@ -14,6 +14,7 @@
 #    under the License.
 
 import base64
+import contextlib
 import inspect
 import os
 import shutil
@@ -55,6 +56,66 @@ class FakeConn(object):
 
     def secretLookupByUUIDString(self, uuid):
         return FakeSecret()
+
+
+class ImageLockTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(ImageLockTestCase, self).setUp()
+
+        self.locked = 0
+
+        @contextlib.contextmanager
+        def fake_lock(*args, **kwargs):
+            self.locked += 1
+            try:
+                yield
+            finally:
+                self.locked -= 1
+
+        lock_patcher = mock.patch.object(lockutils, 'lock',
+                                         autospec=True, side_effect=fake_lock)
+        self.mock_lock = lock_patcher.start()
+        self.addCleanup(lock_patcher.stop)
+
+        # Choice of Qcow2 is arbitrary
+        # resolve_driver_format isn't relevant here, and causes problems
+        with mock.patch.object(imagebackend.Qcow2, 'resolve_driver_format'):
+            self.image = imagebackend.Qcow2(path='/instances/uuid/foo')
+
+    def test_lock(self):
+        # Calling lock should result in a lock being held for the duration
+        # of the context. Calling lock inside the context should not call
+        # lock again.
+        with self.image.lock():
+            # We should be inside a single lock
+            self.assertEqual(1, self.locked)
+            with self.image.lock():
+                # We should still be inside a single lock
+                self.assertEqual(1, self.locked)
+
+            # We shouldn't have released the lock when the inner lock exited
+            self.assertEqual(1, self.locked)
+
+        # We should have released the lock when the outer lock exited
+        self.assertEqual(0, self.locked)
+
+    def test_lock_exception(self):
+        # The re-entrance guard shouldn't get confused if a context raises
+        # an exception
+
+        try:
+            with self.image.lock():
+                self.assertEqual(1, self.locked)
+                raise Exception()
+        except Exception:
+            pass
+
+        self.assertEqual(0, self.locked)
+
+        # Ensure we left our locked context, even though it raised an exception
+        # We check by locking gain and ensuring we re-take the lock.
+        with self.image.lock():
+            self.assertEqual(1, self.locked)
 
 
 class _ImageTestCase(object):

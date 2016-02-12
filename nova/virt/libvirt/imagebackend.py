@@ -20,6 +20,7 @@ import functools
 import os
 import shutil
 
+from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -116,6 +117,7 @@ class Image(object):
         # instance files, to cover the scenario where multiple compute nodes
         # are trying to create a base file at the same time
         self.lock_path = os.path.join(CONF.instances_path, 'locks')
+        self.locked = False
 
     def _supports_encryption(self):
         """Used to test that the backend supports encryption.
@@ -418,6 +420,32 @@ class Image(object):
         :returns: an instance of nova.virt.image.model.Image
         """
         raise NotImplementedError()
+
+    @contextlib.contextmanager
+    def lock(self):
+        # We protect here against re-entrance. We assume that this object
+        # isn't shared between multiple threads. The actual lock is
+        # independent of this object, so multiple threads/processes is safe
+        # as long as each has their own object.
+        if self.locked:
+            yield
+
+        else:
+            lock_name = os.path.basename(self.path)
+
+            # This MUST be compatible with the lock used by
+            # nova.utils.synchronized().
+            # NOTE(mdbooth): Ideally there would be a way create a context
+            # manager which uses nova.utils.synchronized directly.
+            # Unfortunately I can't find one.
+            with lockutils.lock(lock_name, lock_file_prefix='nova-',
+                                external=True,
+                                lock_path=self.lock_path):
+                self.locked = True
+                try:
+                    yield
+                finally:
+                    self.locked = False
 
     def import_file(self, instance, local_file, remote_name):
         """Import an image from local storage into this backend.

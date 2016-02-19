@@ -590,9 +590,6 @@ class LibvirtConnTestCase(test.NoDBTestCase):
 
     REQUIRES_LOCKING = True
 
-    _EPHEMERAL_20_DEFAULT = ('ephemeral_20_%s' %
-                             utils.get_hash_str(disk._DEFAULT_FILE_SYSTEM)[:7])
-
     def setUp(self):
         super(LibvirtConnTestCase, self).setUp()
         self.flags(fake_call=True)
@@ -641,6 +638,10 @@ class LibvirtConnTestCase(test.NoDBTestCase):
           </devices>
         </domain>
         """
+        self.ephemeral_20_default = ('ephemeral_20_%s' %
+                            utils.get_hash_str(disk._DEFAULT_FILE_SYSTEM)[:7])
+
+        imagebackend.ImageCacheLocalPool.reset()
 
     def relpath(self, path):
         return os.path.relpath(path, CONF.instances_path)
@@ -8170,33 +8171,40 @@ class LibvirtConnTestCase(test.NoDBTestCase):
         base_dir = os.path.join(CONF.instances_path,
                                 CONF.image_cache_subdirectory_name)
         instance = objects.Instance(**self.test_instance)
+
+        fake_check_backing_from_func = \
+            lambda bound_self, func, cache_name, fallback_from_host=None: \
+                func(os.path.join(base_dir, cache_name))
+
         with test.nested(
             mock.patch.object(drvr, '_fetch_instance_kernel_ramdisk'),
             mock.patch.object(libvirt_driver.libvirt_utils, 'fetch_image'),
-            mock.patch.object(drvr, '_create_ephemeral'),
+            mock.patch.object(drvr, '_create_ephemeral', autospec=True),
             mock.patch.object(imagebackend.Image, 'verify_base_size'),
-            mock.patch.object(imagebackend.Image, 'get_disk_size')
+            mock.patch.object(imagebackend.Image, 'get_disk_size'),
+            mock.patch.object(imagebackend.Qcow2, 'check_backing_from_func',
+                              side_effect=fake_check_backing_from_func,
+                              autospec=True),
         ) as (fetch_kernel_ramdisk_mock, fetch_image_mock,
-                create_ephemeral_mock, verify_base_size_mock, disk_size_mock):
+              create_ephemeral_mock, verify_base_size_mock, disk_size_mock,
+              check_backing_from_func_mock):
+
             drvr._create_images_and_backing(self.context, instance,
                                             "/fake/instance/dir",
-                                            disk_info)
-            self.assertEqual(len(create_ephemeral_mock.call_args_list), 1)
-            m_args, m_kwargs = create_ephemeral_mock.call_args_list[0]
-            self.assertEqual(
-                    os.path.join(base_dir, 'ephemeral_1_default'),
-                    m_kwargs['target'])
+                                            disk_info,
+                                            fallback_from_host='fake-host')
+            create_ephemeral_mock.assert_called_once_with(
+                os.path.join(base_dir, 'ephemeral_1_default'),
+                ephemeral_size=instance.ephemeral_gb,
+                fs_label='ephemeral_1_default', os_type=instance.os_type,
+                is_block_dev=False)
             self.assertEqual(len(fetch_image_mock.call_args_list), 1)
             m_args, m_kwargs = fetch_image_mock.call_args_list[0]
             self.assertEqual(
                     os.path.join(base_dir, 'fake_image_backing_file'),
                     m_kwargs['target'])
-            verify_base_size_mock.assert_has_calls([
-                mock.call(os.path.join(base_dir, 'fake_image_backing_file'),
-                          25165824),
-                mock.call(os.path.join(base_dir, 'ephemeral_1_default'),
-                          1073741824)
-            ])
+            verify_base_size_mock.assert_called_once_with(
+                os.path.join(base_dir, 'fake_image_backing_file'), 25165824)
 
     def test_create_images_and_backing_disk_info_none(self):
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
@@ -8879,6 +8887,9 @@ class LibvirtConnTestCase(test.NoDBTestCase):
             self.stubs.Set(imagebackend.Image,
                         'cache',
                         fake_none)
+            self.stubs.Set(imagebackend.Qcow2,
+                        'create_from_func',
+                        fake_none)
 
             drvr.spawn(self.context, instance, image_meta, [], 'herp',
                         network_info=network_info)
@@ -8925,15 +8936,19 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                    image_meta, [], None)
         self.assertTrue(self.create_image_called)
 
-    def test_spawn_from_volume_calls_cache(self):
+    @mock.patch.object(imagebackend.Qcow2, 'create_from_func',
+                       autospec=True)
+    def test_spawn_from_volume_calls_cache(self, mock_create_from_func):
         self.cache_called_for_disk = False
 
         def fake_none(*args, **kwargs):
             return
 
         def fake_cache(*args, **kwargs):
-            if kwargs.get('image_id') == 'my_fake_image':
-                self.cache_called_for_disk = True
+            # We should only be calling cache() for images, so image should
+            # always be given
+            self.assertEqual('my_fake_image', kwargs.get('image_id'))
+            self.cache_called_for_disk = True
 
         def fake_get_info(instance):
             return hardware.InstanceInfo(state=power_state.RUNNING)
@@ -9134,7 +9149,9 @@ class LibvirtConnTestCase(test.NoDBTestCase):
         self.mox.ReplayAll()
         drvr._chown_disk_config_for_instance(instance)
 
-    def _test_create_image_plain(self, os_type='', filename='', mkfs=False):
+    @mock.patch.object(disk, 'mkfs', autospec=True)
+    def _test_create_image_plain(self, mock_mkfs, os_type='', filename='',
+                                 mkfs=False):
         gotFiles = []
 
         def fake_image(self, instance, name, image_type=''):
@@ -9159,8 +9176,13 @@ class LibvirtConnTestCase(test.NoDBTestCase):
 
                 def cache(self, fetch_func, filename, size=None,
                           *args, **kwargs):
-                    gotFiles.append({'filename': filename,
-                                     'size': size})
+                    gotFiles.append({'filename': filename, 'size': size})
+
+                def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+                    gotFiles.append({'filename': cache_name, 'size': size})
+                    gotFiles.append({'filename': self.path, 'size': size})
+                    func(cache_name)
 
                 def snapshot(self, name):
                     pass
@@ -9208,22 +9230,27 @@ class LibvirtConnTestCase(test.NoDBTestCase):
              'size': 10 * units.Gi},
             {'filename': filename,
              'size': 20 * units.Gi},
+            {'filename': os.path.join(instance['name'], 'disk.local'),
+             'size': 20 * units.Gi},
             ]
-        self.assertEqual(gotFiles, wantFiles)
+        self.assertEqual(wantFiles, gotFiles)
+
+        mock_mkfs.assert_called_once_with(os_type, 'ephemeral0', filename,
+                                          run_as_root=False, specified_fs=None)
 
     def test_create_image_plain_os_type_blank(self):
         self._test_create_image_plain(os_type='',
-                                      filename=self._EPHEMERAL_20_DEFAULT,
+                                      filename=self.ephemeral_20_default,
                                       mkfs=False)
 
     def test_create_image_plain_os_type_none(self):
         self._test_create_image_plain(os_type=None,
-                                      filename=self._EPHEMERAL_20_DEFAULT,
+                                      filename=self.ephemeral_20_default,
                                       mkfs=False)
 
     def test_create_image_plain_os_type_set_no_fs(self):
         self._test_create_image_plain(os_type='test',
-                                      filename=self._EPHEMERAL_20_DEFAULT,
+                                      filename=self.ephemeral_20_default,
                                       mkfs=False)
 
     def test_create_image_plain_os_type_set_with_fs(self):
@@ -9236,14 +9263,13 @@ class LibvirtConnTestCase(test.NoDBTestCase):
 
     @mock.patch('nova.virt.libvirt.driver.imagecache')
     def test_create_image_initrd(self, mock_imagecache):
-        INITRD = self._EPHEMERAL_20_DEFAULT + '.initrd'
-        KERNEL = 'vmlinuz.' + self._EPHEMERAL_20_DEFAULT
+        fake_initrd = 'fake.initrd'
+        fake_kernel = 'vmlinuz.fake'
 
         mock_imagecache.get_cache_fname.side_effect = \
-                [KERNEL,
-                 INITRD,
-                 self._EPHEMERAL_20_DEFAULT + '.img']
-        filename = self._EPHEMERAL_20_DEFAULT
+                [fake_kernel,
+                 fake_initrd,
+                 self.ephemeral_20_default]
 
         gotFiles = []
 
@@ -9266,14 +9292,17 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                                  size, *args, **kwargs):
                     pass
 
+                def create_from_func(self, context, func, cache_name, size,
+                                     fallback_from_host=None):
+                    gotFiles.append({'filename': self.path, 'size': size})
+
                 def cache(self, fetch_func, filename, size=None,
                           *args, **kwargs):
-                    gotFiles.append({'filename': filename,
-                                     'size': size})
-                    if filename == INITRD:
+                    gotFiles.append({'filename': filename, 'size': size})
+                    if filename == fake_initrd:
                         outer.assertEqual(fetch_func,
                                 fake_libvirt_utils.fetch_raw_image)
-                    if filename == KERNEL:
+                    if filename == fake_kernel:
                         outer.assertEqual(fetch_func,
                                 fake_libvirt_utils.fetch_raw_image)
 
@@ -9313,13 +9342,13 @@ class LibvirtConnTestCase(test.NoDBTestCase):
             driver._create_image(context, instance, disk_info['mapping'])
 
         wantFiles = [
-            {'filename': KERNEL,
+            {'filename': fake_kernel,
              'size': None},
-            {'filename': INITRD,
+            {'filename': fake_initrd,
              'size': None},
-            {'filename': self._EPHEMERAL_20_DEFAULT + '.img',
+            {'filename': self.ephemeral_20_default,
              'size': 10 * units.Gi},
-            {'filename': filename,
+            {'filename': os.path.join(instance.name, 'disk.local'),
              'size': 20 * units.Gi},
             ]
         self.assertEqual(wantFiles, gotFiles)
@@ -9340,6 +9369,11 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                     self.locked = True
                     yield
                     self.locked = False
+
+                def create_from_func(self, context, func, cache_name, size,
+                                     fallback_from_host=None):
+                    gotFiles.append({'filename': cache_name, 'size': size})
+                    gotFiles.append({'filename': self.path, 'size': size})
 
                 def create_image(self, prepare_template, base,
                                  size, *args, **kwargs):
@@ -9407,15 +9441,23 @@ class LibvirtConnTestCase(test.NoDBTestCase):
             instance_ref['system_metadata']['instance_type_swap'] = 500
 
         gotFiles, _ = self._create_image_helper(enable_swap)
+
+        # Instance path from FakeImage uses image name in the path
+        instance_name = 'instance-00000001'
+
         wantFiles = [
             {'filename': '356a192b7913b04c54574d18c28d46e6395428ab',
              'size': 10 * units.Gi},
-            {'filename': self._EPHEMERAL_20_DEFAULT,
+            {'filename': self.ephemeral_20_default,
+             'size': 20 * units.Gi},
+            {'filename': os.path.join(instance_name, 'disk.local'),
              'size': 20 * units.Gi},
             {'filename': 'swap_500',
              'size': 500 * units.Mi},
+            {'filename': os.path.join(instance_name, 'disk.swap'),
+             'size': 500 * units.Mi},
             ]
-        self.assertEqual(gotFiles, wantFiles)
+        self.assertEqual(wantFiles, gotFiles)
 
     def test_create_image_with_configdrive(self):
         def enable_configdrive(instance_ref):
@@ -9471,13 +9513,15 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                                             image_meta)
 
         with mock.patch.object(libvirt_driver.libvirt_utils,
-                               'copy_image') as mock_copy:
+                               'copy_image') as mock_copy,\
+                mock.patch.object(nova.virt.libvirt.imagebackend.Qcow2,
+                                  'create_from_func', autospec=True):
             drvr._create_image(self.context, instance, disk_info['mapping'],
                                fallback_from_host='fake-source-host')
-            mock_copy.assert_called_once_with(src='fake-target',
-                                              dest='fake-target',
-                                              host='fake-source-host',
-                                              receive=True)
+        mock_copy.assert_called_once_with(src='fake-target',
+                                          dest='fake-target',
+                                          host='fake-source-host',
+                                          receive=True)
 
     @mock.patch.object(nova.virt.libvirt.imagebackend.Image, 'cache')
     def test_create_image_resize_snap_backend(self, mock_cache):
@@ -9505,8 +9549,7 @@ class LibvirtConnTestCase(test.NoDBTestCase):
         self.flags(default_ephemeral_format='ext3')
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
         drvr._create_ephemeral('/dev/something', 20, 'myVol', 'linux',
-                               is_block_dev=True, max_size=20,
-                               specified_fs='ext4')
+                               is_block_dev=True, specified_fs='ext4')
         mock_exec.assert_called_once_with('mkfs', '-t', 'ext4', '-F', '-L',
                                           'myVol', '/dev/something',
                                           run_as_root=True)
@@ -9547,7 +9590,7 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                       '/dev/something', run_as_root=True)
         self.mox.ReplayAll()
         drvr._create_ephemeral('/dev/something', 20, 'myVol', 'linux',
-                               is_block_dev=True, max_size=20)
+                               is_block_dev=True)
 
     def test_create_ephemeral_with_conf(self):
         CONF.set_override('default_ephemeral_format', 'ext4')
@@ -9587,7 +9630,7 @@ class LibvirtConnTestCase(test.NoDBTestCase):
         utils.execute('mkswap', '/dev/something', run_as_root=False)
         self.mox.ReplayAll()
 
-        drvr._create_swap('/dev/something', 1, max_size=20)
+        drvr._create_swap('/dev/something', 1)
 
     def test_get_console_output_file(self):
         fake_libvirt_utils.files['console.log'] = '01234567890'

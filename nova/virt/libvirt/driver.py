@@ -2967,7 +2967,7 @@ class LibvirtDriver(driver.ComputeDriver):
     @staticmethod
     def _create_ephemeral(target, ephemeral_size,
                           fs_label, os_type, is_block_dev=False,
-                          max_size=None, context=None, specified_fs=None):
+                          specified_fs=None):
         if not is_block_dev:
             libvirt_utils.create_image('raw', target, '%dG' % ephemeral_size)
 
@@ -2976,7 +2976,7 @@ class LibvirtDriver(driver.ComputeDriver):
                   specified_fs=specified_fs)
 
     @staticmethod
-    def _create_swap(target, swap_mb, max_size=None, context=None):
+    def _create_swap(target, swap_mb):
         """Create a swap file of specified size."""
         libvirt_utils.create_image('raw', target, '%dM' % swap_mb)
         utils.mkfs('swap', target)
@@ -3219,17 +3219,18 @@ class LibvirtDriver(driver.ComputeDriver):
         ephemeral_gb = instance.ephemeral_gb
         if 'disk.local' in disk_mapping:
             disk_image = image('disk.local')
-            fn = functools.partial(self._create_ephemeral,
-                                   fs_label='ephemeral0',
-                                   os_type=instance.os_type,
-                                   is_block_dev=disk_image.is_block_dev)
-            fname = "ephemeral_%s_%s" % (ephemeral_gb, file_extension)
-            size = ephemeral_gb * units.Gi
-            disk_image.cache(fetch_func=fn,
-                             context=context,
-                             filename=fname,
-                             size=size,
-                             ephemeral_size=ephemeral_gb)
+            create_func = lambda target: self._create_ephemeral(
+                    target, ephemeral_gb, 'ephemeral0', instance.os_type,
+                    is_block_dev=disk_image.is_block_dev)
+            with disk_image.lock():
+                cache_name = "ephemeral_%s_%s" % (ephemeral_gb, file_extension)
+                if disk_image.exists():
+                    disk_image.check_backing_from_func(create_func, cache_name,
+                                                       fallback_from_host)
+                else:
+                    disk_image.create_from_func(context, create_func,
+                                                cache_name,
+                                                ephemeral_gb * units.Gi)
 
         for idx, eph in enumerate(driver.block_device_info_get_ephemerals(
                 block_device_info)):
@@ -3240,18 +3241,19 @@ class LibvirtDriver(driver.ComputeDriver):
                 msg = _("%s format is not supported") % specified_fs
                 raise exception.InvalidBDMFormat(details=msg)
 
-            fn = functools.partial(self._create_ephemeral,
-                                   fs_label='ephemeral%d' % idx,
-                                   os_type=instance.os_type,
-                                   is_block_dev=disk_image.is_block_dev)
-            size = eph['size'] * units.Gi
-            fname = "ephemeral_%s_%s" % (eph['size'], file_extension)
-            disk_image.cache(fetch_func=fn,
-                             context=context,
-                             filename=fname,
-                             size=size,
-                             ephemeral_size=eph['size'],
-                             specified_fs=specified_fs)
+            create_func = lambda target: self._create_ephemeral(
+                    target, eph['size'], 'ephemeral%d' % idx, instance.os_type,
+                    is_block_dev=disk_image.is_block_dev,
+                    specified_fs=specified_fs)
+            with disk_image.lock():
+                cache_name = "ephemeral_%s_%s" % (eph['size'], file_extension)
+                if disk_image.exists():
+                    disk_image.check_backing_from_func(create_func, cache_name,
+                                                       fallback_from_host)
+                else:
+                    disk_image.create_from_func(context, create_func,
+                                                cache_name,
+                                                eph['size'] * units.Gi)
 
         if 'disk.swap' in disk_mapping:
             mapping = disk_mapping['disk.swap']
@@ -3266,12 +3268,18 @@ class LibvirtDriver(driver.ComputeDriver):
                 swap_mb = inst_type['swap']
 
             if swap_mb > 0:
-                size = swap_mb * units.Mi
-                image('disk.swap').cache(fetch_func=self._create_swap,
-                                         context=context,
-                                         filename="swap_%s" % swap_mb,
-                                         size=size,
-                                         swap_mb=swap_mb)
+                create_func = lambda target: self._create_swap(target, swap_mb)
+                swap_disk = image('disk.swap')
+                with swap_disk.lock():
+                    cache_name = 'swap_%s' % swap_mb
+                    if swap_disk.exists():
+                        swap_disk.check_backing_from_func(create_func,
+                                                          cache_name,
+                                                          fallback_from_host)
+                    else:
+                        swap_disk.create_from_func(context, create_func,
+                                                   cache_name,
+                                                   swap_mb * units.Mi)
 
         if CONF.libvirt.virt_type == 'uml':
             libvirt_utils.chown(image('disk').path, 'root')
@@ -6774,20 +6782,22 @@ class LibvirtDriver(driver.ComputeDriver):
                 image = self.image_backend.image(instance,
                                                  instance_disk,
                                                  CONF.libvirt.images_type)
+
                 if cache_name.startswith('ephemeral'):
-                    image.cache(fetch_func=self._create_ephemeral,
-                                fs_label=cache_name,
-                                os_type=instance.os_type,
-                                filename=cache_name,
-                                size=info['virt_disk_size'],
-                                ephemeral_size=instance.ephemeral_gb)
+                    create_func = functools.partial(
+                        self._create_ephemeral,
+                        ephemeral_size=instance.ephemeral_gb,
+                        fs_label=cache_name,
+                        os_type=instance.os_type,
+                        is_block_dev=False)
+                    image.check_backing_from_func(create_func, cache_name,
+                        fallback_from_host=fallback_from_host)
                 elif cache_name.startswith('swap'):
-                    inst_type = instance.get_flavor()
-                    swap_mb = inst_type.swap
-                    image.cache(fetch_func=self._create_swap,
-                                filename="swap_%s" % swap_mb,
-                                size=swap_mb * units.Mi,
-                                swap_mb=swap_mb)
+                    flavor = instance.get_flavor()
+                    create_func = functools.partial(self._create_swap,
+                                                    swap_mb=flavor.swap)
+                    image.check_backing_from_func(create_func, cache_name,
+                          fallback_from_host=fallback_from_host)
                 else:
                     self._try_fetch_image_cache(image,
                                                 libvirt_utils.fetch_image,

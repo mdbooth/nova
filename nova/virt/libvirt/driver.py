@@ -2775,7 +2775,7 @@ class LibvirtDriver(driver.ComputeDriver):
     @staticmethod
     def _create_ephemeral(target, ephemeral_size,
                           fs_label, os_type, is_block_dev=False,
-                          max_size=None, context=None, specified_fs=None):
+                          specified_fs=None):
         if not is_block_dev:
             libvirt_utils.create_image('raw', target, '%dG' % ephemeral_size)
 
@@ -2784,7 +2784,7 @@ class LibvirtDriver(driver.ComputeDriver):
                   specified_fs=specified_fs)
 
     @staticmethod
-    def _create_swap(target, swap_mb, max_size=None, context=None):
+    def _create_swap(target, swap_mb):
         """Create a swap file of specified size."""
         libvirt_utils.create_image('raw', target, '%dM' % swap_mb)
         utils.mkfs('swap', target)
@@ -2804,7 +2804,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # TODO(mikal): there is a bug here if images_type has
         # changed since creation of the instance, but I am pretty
         # sure that this bug already exists.
-        return 'rbd' if CONF.libvirt.images_type == 'rbd' else 'raw'
+        return 'rbd' if CONF.libvirt.images_type == 'rbd' else 'flat'
 
     def _chown_console_log_for_instance(self, instance):
         console_log = self._get_console_log_path(instance)
@@ -2906,11 +2906,8 @@ class LibvirtDriver(driver.ComputeDriver):
             instance, disk_mapping)
 
         def image(fname, image_type=CONF.libvirt.images_type):
-            return self.image_backend.image(instance,
-                                            fname + suffix, image_type)
-
-        def raw(fname):
-            return image(fname, image_type='raw')
+            return self.image_backend.image(instance, fname + suffix,
+                                            image_type=image_type)
 
         # ensure directories exist and are writable
         fileutils.ensure_tree(libvirt_utils.get_instance_path(instance))
@@ -2933,18 +2930,10 @@ class LibvirtDriver(driver.ComputeDriver):
                            'kernel_id': instance.kernel_id,
                            'ramdisk_id': instance.ramdisk_id}
 
-        if disk_images['kernel_id']:
-            fname = imagecache.get_cache_fname(disk_images['kernel_id'])
-            raw('kernel').cache(fetch_func=libvirt_utils.fetch_raw_image,
-                                context=context,
-                                filename=fname,
-                                image_id=disk_images['kernel_id'])
-            if disk_images['ramdisk_id']:
-                fname = imagecache.get_cache_fname(disk_images['ramdisk_id'])
-                raw('ramdisk').cache(fetch_func=libvirt_utils.fetch_raw_image,
-                                     context=context,
-                                     filename=fname,
-                                     image_id=disk_images['ramdisk_id'])
+        self._fetch_instance_kernel_ramdisk(
+            context, instance,
+            disk_images['kernel_id'], disk_images['ramdisk_id'],
+            suffix=suffix, fallback_from_host=fallback_from_host)
 
         inst_type = instance.get_flavor()
 
@@ -2975,7 +2964,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 # Tell the storage backend about the config drive
                 config_drive_image = self.image_backend.image(
                     instance, 'disk.config' + suffix,
-                    self._get_disk_config_image_type())
+                    image_type=self._get_disk_config_image_type())
 
                 config_drive_image.import_file(
                     instance, configdrive_path, 'disk.config' + suffix)
@@ -2992,31 +2981,26 @@ class LibvirtDriver(driver.ComputeDriver):
         # currently happens only on rescue - we still don't want to
         # create a base image.
         if not booted_from_volume:
-            root_fname = imagecache.get_cache_fname(disk_images['image_id'])
             size = instance.root_gb * units.Gi
 
             if size == 0 or suffix == '.rescue':
                 size = None
 
-            backend = image('disk')
+            root_disk = image('disk')
             if instance.task_state == task_states.RESIZE_FINISH:
-                backend.create_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
-            if backend.SUPPORTS_CLONE:
-                def clone_fallback_to_fetch(*args, **kwargs):
-                    try:
-                        backend.clone(context, disk_images['image_id'])
-                    except exception.ImageUnacceptable:
-                        libvirt_utils.fetch_image(*args, **kwargs)
-                fetch_func = clone_fallback_to_fetch
+                root_disk.create_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
+
+            if root_disk.exists():
+                root_disk.check_backing_from_image(
+                    context, disk_images['image_id'],
+                    fallback=fallback_from_host)
             else:
-                fetch_func = libvirt_utils.fetch_image
-            self._try_fetch_image_cache(backend, fetch_func, context,
-                                        root_fname, disk_images['image_id'],
-                                        instance, size, fallback_from_host)
+                root_disk.create_from_image(context, disk_images['image_id'],
+                                            size, fallback=fallback_from_host)
 
             if need_inject:
-                self._inject_data(backend, instance, network_info, admin_pass,
-                                  files)
+                self._inject_data(root_disk, instance, network_info,
+                                  admin_pass, files)
 
         elif need_inject:
             LOG.warn(_LW('File injection into a boot from volume '
@@ -3031,40 +3015,43 @@ class LibvirtDriver(driver.ComputeDriver):
 
         ephemeral_gb = instance.ephemeral_gb
         if 'disk.local' in disk_mapping:
-            disk_image = image('disk.local')
-            fn = functools.partial(self._create_ephemeral,
-                                   fs_label='ephemeral0',
-                                   os_type=instance.os_type,
-                                   is_block_dev=disk_image.is_block_dev)
-            fname = "ephemeral_%s_%s" % (ephemeral_gb, file_extension)
-            size = ephemeral_gb * units.Gi
-            disk_image.cache(fetch_func=fn,
-                             context=context,
-                             filename=fname,
-                             size=size,
-                             ephemeral_size=ephemeral_gb)
+            disk_local = image('disk.local')
+            create_func = lambda target: self._create_ephemeral(
+                    target, ephemeral_gb, 'ephemeral0', instance.os_type,
+                    is_block_dev=disk_local.is_block_dev)
+
+            cache_name = "ephemeral_%s_%s" % (ephemeral_gb, file_extension)
+            if disk_local.exists():
+                disk_local.check_backing_from_func(create_func, cache_name,
+                                                   fallback=fallback_from_host)
+            else:
+                disk_local.create_from_func(context, create_func,
+                                            cache_name,
+                                            ephemeral_gb * units.Gi,
+                                            fallback=fallback_from_host)
 
         for idx, eph in enumerate(driver.block_device_info_get_ephemerals(
                 block_device_info)):
-            disk_image = image(blockinfo.get_eph_disk(idx))
+            eph_disk = image(blockinfo.get_eph_disk(idx))
 
             specified_fs = eph.get('guest_format')
             if specified_fs and not self.is_supported_fs_format(specified_fs):
                 msg = _("%s format is not supported") % specified_fs
                 raise exception.InvalidBDMFormat(details=msg)
 
-            fn = functools.partial(self._create_ephemeral,
-                                   fs_label='ephemeral%d' % idx,
-                                   os_type=instance.os_type,
-                                   is_block_dev=disk_image.is_block_dev)
-            size = eph['size'] * units.Gi
-            fname = "ephemeral_%s_%s" % (eph['size'], file_extension)
-            disk_image.cache(fetch_func=fn,
-                             context=context,
-                             filename=fname,
-                             size=size,
-                             ephemeral_size=eph['size'],
-                             specified_fs=specified_fs)
+            create_func = lambda target: self._create_ephemeral(
+                    target, eph['size'], 'ephemeral%d' % idx, instance.os_type,
+                    is_block_dev=eph_disk.is_block_dev,
+                    specified_fs=specified_fs)
+
+            cache_name = "ephemeral_%s_%s" % (eph['size'], file_extension)
+            if eph_disk.exists():
+                eph_disk.check_backing_from_func(create_func, cache_name,
+                                                 fallback=fallback_from_host)
+            else:
+                eph_disk.create_from_func(context, create_func,
+                                          cache_name, eph['size'] * units.Gi,
+                                          fallback=fallback_from_host)
 
         if 'disk.swap' in disk_mapping:
             mapping = disk_mapping['disk.swap']
@@ -3079,12 +3066,17 @@ class LibvirtDriver(driver.ComputeDriver):
                 swap_mb = inst_type['swap']
 
             if swap_mb > 0:
-                size = swap_mb * units.Mi
-                image('disk.swap').cache(fetch_func=self._create_swap,
-                                         context=context,
-                                         filename="swap_%s" % swap_mb,
-                                         size=size,
-                                         swap_mb=swap_mb)
+                create_func = lambda target: self._create_swap(target, swap_mb)
+                swap_disk = image('disk.swap')
+
+                cache_name = 'swap_%s' % swap_mb
+                if swap_disk.exists():
+                    swap_disk.check_backing_from_func(
+                        create_func, cache_name, fallback=fallback_from_host)
+                else:
+                    swap_disk.create_from_func(context, create_func,
+                                               cache_name, swap_mb * units.Mi,
+                                               fallback=fallback_from_host)
 
         if CONF.libvirt.virt_type == 'uml':
             libvirt_utils.chown(image('disk').path, 'root')
@@ -6255,45 +6247,23 @@ class LibvirtDriver(driver.ComputeDriver):
             raise exception.NoActiveMigrationForInstance(
                 instance_id=instance.uuid)
 
-    def _try_fetch_image(self, context, path, image_id, instance,
-                         fallback_from_host=None):
-        try:
-            libvirt_utils.fetch_image(context, path, image_id)
-        except exception.ImageNotFound:
-            if not fallback_from_host:
-                raise
-            LOG.debug("Image %(image_id)s doesn't exist anymore on "
-                      "image service, attempting to copy image "
-                      "from %(host)s",
-                      {'image_id': image_id, 'host': fallback_from_host})
-            libvirt_utils.copy_image(src=path, dest=path,
-                                     host=fallback_from_host,
-                                     receive=True)
-
     def _fetch_instance_kernel_ramdisk(self, context, instance,
-                                       fallback_from_host=None):
+                                       kernel_id, ramdisk_id,
+                                       suffix='', fallback_from_host=None):
         """Download kernel and ramdisk for instance in instance directory."""
-        instance_dir = libvirt_utils.get_instance_path(instance)
-        if instance.kernel_id:
-            kernel_path = os.path.join(instance_dir, 'kernel')
-            # NOTE(dsanders): only fetch image if it's not available at
-            # kernel_path. This also avoids ImageNotFound exception if
-            # the image has been deleted from glance
-            if not os.path.exists(kernel_path):
-                self._try_fetch_image(context,
-                                      kernel_path,
-                                      instance.kernel_id,
-                                      instance, fallback_from_host)
-            if instance.ramdisk_id:
-                ramdisk_path = os.path.join(instance_dir, 'ramdisk')
-                # NOTE(dsanders): only fetch image if it's not available at
-                # ramdisk_path. This also avoids ImageNotFound exception if
-                # the image has been deleted from glance
-                if not os.path.exists(ramdisk_path):
-                    self._try_fetch_image(context,
-                                          ramdisk_path,
-                                          instance.ramdisk_id,
-                                          instance, fallback_from_host)
+
+        for name, image_id in (('kernel' + suffix, kernel_id),
+                               ('ramdisk' + suffix, ramdisk_id)):
+            # No point checking ramdisk if there's no kernel
+            if image_id is None:
+                break
+
+            # External boot images don't use backing files
+            disk = self.image_backend.image(instance, name, image_type='flat')
+
+            if not disk.exists():
+                disk.create_from_image(context, image_id, 0,
+                                       fallback=fallback_from_host)
 
     def rollback_live_migration_at_destination(self, context, instance,
                                                network_info,
@@ -6404,7 +6374,9 @@ class LibvirtDriver(driver.ComputeDriver):
 
                 # if image has kernel and ramdisk, just download
                 # following normal way.
-                self._fetch_instance_kernel_ramdisk(context, instance)
+                self._fetch_instance_kernel_ramdisk(
+                    context, instance, instance.kernel_id, instance.ramdisk_id,
+                    fallback_from_host=instance.host)
 
         # Establishing connection to volume server.
         block_device_mapping = driver.block_device_info_get_mapping(
@@ -6474,32 +6446,6 @@ class LibvirtDriver(driver.ComputeDriver):
 
         return migrate_data
 
-    def _try_fetch_image_cache(self, image, fetch_func, context, filename,
-                               image_id, instance, size,
-                               fallback_from_host=None):
-        try:
-            image.cache(fetch_func=fetch_func,
-                        context=context,
-                        filename=filename,
-                        image_id=image_id,
-                        size=size)
-        except exception.ImageNotFound:
-            if not fallback_from_host:
-                raise
-            LOG.debug("Image %(image_id)s doesn't exist anymore "
-                      "on image service, attempting to copy "
-                      "image from %(host)s",
-                      {'image_id': image_id, 'host': fallback_from_host},
-                      instance=instance)
-
-            def copy_from_host(target, max_size):
-                libvirt_utils.copy_image(src=target,
-                                         dest=target,
-                                         host=fallback_from_host,
-                                         receive=True)
-            image.cache(fetch_func=copy_from_host,
-                        filename=filename)
-
     def _create_images_and_backing(self, context, instance, instance_dir,
                                    disk_info, fallback_from_host=None):
         """:param context: security context
@@ -6531,36 +6477,34 @@ class LibvirtDriver(driver.ComputeDriver):
                 # Creating backing file follows same way as spawning instances.
                 cache_name = os.path.basename(info['backing_file'])
 
-                image = self.image_backend.image(instance,
+                disk = self.image_backend.image(instance,
                                                  instance_disk,
                                                  CONF.libvirt.images_type)
+
                 if cache_name.startswith('ephemeral'):
-                    image.cache(fetch_func=self._create_ephemeral,
-                                fs_label=cache_name,
-                                os_type=instance.os_type,
-                                filename=cache_name,
-                                size=info['virt_disk_size'],
-                                ephemeral_size=instance.ephemeral_gb)
+                    create_func = functools.partial(
+                        self._create_ephemeral,
+                        ephemeral_size=instance.ephemeral_gb,
+                        fs_label=cache_name,
+                        os_type=instance.os_type,
+                        is_block_dev=False)
+                    disk.check_backing_from_func(create_func, cache_name,
+                                                 fallback=fallback_from_host)
                 elif cache_name.startswith('swap'):
-                    inst_type = instance.get_flavor()
-                    swap_mb = inst_type.swap
-                    image.cache(fetch_func=self._create_swap,
-                                filename="swap_%s" % swap_mb,
-                                size=swap_mb * units.Mi,
-                                swap_mb=swap_mb)
+                    flavor = instance.get_flavor()
+                    create_func = functools.partial(self._create_swap,
+                                                    swap_mb=flavor.swap)
+                    disk.check_backing_from_func(create_func, cache_name,
+                                                 fallback=fallback_from_host)
                 else:
-                    self._try_fetch_image_cache(image,
-                                                libvirt_utils.fetch_image,
-                                                context, cache_name,
-                                                instance.image_ref,
-                                                instance,
-                                                info['virt_disk_size'],
-                                                fallback_from_host)
+                    disk.check_backing_from_image(context, instance.image_ref,
+                                                  fallback=fallback_from_host)
 
         # if image has kernel and ramdisk, just download
         # following normal way.
         self._fetch_instance_kernel_ramdisk(
-            context, instance, fallback_from_host=fallback_from_host)
+            context, instance, instance.kernel_id, instance.ramdisk_id,
+            fallback_from_host=fallback_from_host)
 
     def post_live_migration(self, context, instance, block_device_info,
                             migrate_data=None):

@@ -2416,6 +2416,173 @@ class PloopImportFileTestCase(test.NoDBTestCase):
         self.assertFalse(os.path.isfile(import_file))
 
 
+class CreateFromFuncTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(CreateFromFuncTestCase, self).setUp()
+        self.locked = False
+
+        imagebackend.ImageCacheLocalPool.reset()
+        with mock.patch.object(fileutils, 'ensure_tree'):
+            self.cache = imagebackend.ImageCacheLocalPool.get()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _fake_import_file(context, format, size=0):
+        yield mock.sentinel.import_path
+
+    def _test_uses_import_file(self, disk):
+        # Test that a disk's create_from_func implementation is a
+        # import_file pass-through
+
+        with mock.patch.object(disk, 'import_file',
+                               side_effect=self._fake_import_file) as \
+                mock_import_file:
+            mock_create = mock.Mock()
+
+            disk.create_from_func(mock.sentinel.context, mock_create,
+                                  mock.sentinel.cache_name,
+                                  mock.sentinel.size)
+
+            mock_import_file.assert_called_once_with(mock.sentinel.context,
+                                                     imgmodel.FORMAT_RAW,
+                                                     mock.sentinel.size)
+            mock_create.assert_called_once_with(mock.sentinel.import_path)
+
+    @contextlib.contextmanager
+    def _fake_lock(self):
+        self.locked = True
+        yield
+        self.locked = False
+
+    def test_nobacking(self):
+        # NoBacking should fetch the output from cache, then copy it into
+        # the storage pool via import_file.
+        with mock.patch.object(imagebackend.NoBacking, 'correct_format',
+                               autospec=True):
+            disk = imagebackend.NoBacking(path='/instances/disk')
+
+        with mock.patch.object(self.cache, 'get_cached_func',
+                               autospec=True) as mock_get_cached_func, \
+             mock.patch.object(disk, 'import_file', self._fake_import_file), \
+             mock.patch.object(libvirt_utils, 'copy_image',
+                               autospec=True) as mock_copy_image:
+            disk.create_from_func(mock.sentinel.context,
+                                  mock.sentinel.create,
+                                  mock.sentinel.cache_name,
+                                  mock.sentinel.size,
+                                  fallback_from_host=mock.sentinel.fallback)
+
+            mock_get_cached_func.assert_called_once_with(
+                mock.sentinel.create, mock.sentinel.cache_name,
+                fallback_from_host=mock.sentinel.fallback)
+
+            # Ensure we copied the cached image to the import destination
+            mock_copy_image.assert_called_once_with(
+                mock_get_cached_func.return_value, mock.sentinel.import_path)
+
+    def test_qcow2(self):
+        # Qcow2 should fetch the output from cache, then create a cow overlay
+        with mock.patch.object(imagebackend.Qcow2, 'resolve_driver_format'):
+            disk = imagebackend.Qcow2(path='/instances/disk')
+
+        with mock.patch.object(self.cache, 'get_cached_func', autospec=True) \
+                as mock_get_cached_func,\
+             mock.patch.object(disk, 'lock', self._fake_lock),\
+             mock.patch.object(libvirt_utils, 'create_cow_image',
+                               autospec=True) as mock_create_cow:
+
+            # We should be locked when creating the overlay
+            mock_create_cow.side_effect = lambda *args, **kwargs: \
+                self.assertTrue(self.locked)
+
+            disk.create_from_func(mock.sentinel.context,
+                                  mock.sentinel.create,
+                                  mock.sentinel.cache_name,
+                                  mock.sentinel.size,
+                                  fallback_from_host=mock.sentinel.fallback)
+
+        mock_create_cow.assert_called_once_with(
+            mock_get_cached_func.return_value, disk.path)
+        mock_get_cached_func.assert_called_once_with(
+            mock.sentinel.create, mock.sentinel.cache_name,
+            fallback_from_host=mock.sentinel.fallback)
+
+    def test_lvm(self):
+        # Lvm should be an import_file pass-through
+        self.flags(group='libvirt', images_volume_group='lvm')
+        with mock.patch.object(keymgr, 'API', autospec=True):
+            disk = imagebackend.Lvm(instance=mock.Mock(),
+                                    disk_name=uuidutils.generate_uuid())
+
+        # LVM just passes through to import_file. It does not use the cache.
+        with mock.patch.object(disk, 'import_file',
+                               side_effect=self._fake_import_file) as \
+                mock_import_file:
+            mock_create = mock.Mock()
+
+            disk.create_from_func(mock.sentinel.context, mock_create,
+                                  mock.sentinel.cache_name,
+                                  mock.sentinel.size)
+
+            mock_import_file.assert_called_once_with(mock.sentinel.context,
+                                                     imgmodel.FORMAT_RAW,
+                                                     mock.sentinel.size)
+            mock_create.assert_called_once_with(mock.sentinel.import_path)
+
+    @mock.patch.object(rbd_utils, 'RBDDriver', autospec=True)
+    def test_rbd(self, mock_driver):
+        # Rbd should fetch the output from cache, then import it
+        instance = objects.Instance(id=1, uuid=uuidutils.generate_uuid())
+        disk = imagebackend.Rbd(instance=instance, disk_name='disk')
+        disk.driver = mock_driver
+
+        with mock.patch.object(self.cache, 'get_cached_func', autospec=True) \
+                as mock_get_cached_func,\
+             mock.patch.object(disk, 'lock', self._fake_lock):
+
+            # We should be locked when importing the image
+            mock_driver.import_image.side_effect = lambda *args, **kwargs: \
+                self.assertTrue(self.locked)
+
+            disk.create_from_func(mock.sentinel.context,
+                                  mock.sentinel.create,
+                                  mock.sentinel.cache_name,
+                                  mock.sentinel.size,
+                                  fallback_from_host=mock.sentinel.fallback)
+
+        self.assertTrue(mock_driver.import_image.called)
+        mock_get_cached_func.assert_called_once_with(
+            mock.sentinel.create, mock.sentinel.cache_name,
+            fallback_from_host=mock.sentinel.fallback)
+
+    def test_ploop(self):
+        # Ploop should fetch the output from cache, then import it with
+        # import_file
+        disk = imagebackend.Ploop(path='/instances/disk')
+
+        with mock.patch.object(self.cache, 'get_cached_func', autospec=True) \
+                as mock_get_cached_func,\
+             mock.patch.object(disk, 'import_file',
+                               side_effect=self._fake_import_file) \
+                as mock_import_file,\
+             mock.patch.object(libvirt_utils, 'copy_image', autospec=True) \
+                as mock_copy_image:
+
+            disk.create_from_func(mock.sentinel.context,
+                                  mock.sentinel.create,
+                                  mock.sentinel.cache_name,
+                                  mock.sentinel.size,
+                                  fallback_from_host=mock.sentinel.fallback)
+
+        mock_get_cached_func.assert_called_once_with(
+            mock.sentinel.create, mock.sentinel.cache_name,
+            fallback_from_host=mock.sentinel.fallback)
+        mock_import_file.assert_called_once_with(
+            mock.sentinel.context, imgmodel.FORMAT_RAW, mock.sentinel.size)
+        mock_copy_image.assert_called_once_with(
+            mock_get_cached_func.return_value, mock.sentinel.import_path)
+
+
 class BackendTestCase(test.NoDBTestCase):
     INSTANCE = objects.Instance(id=1, uuid=uuidutils.generate_uuid())
     NAME = 'fake-name.suffix'

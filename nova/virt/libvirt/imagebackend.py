@@ -372,6 +372,24 @@ class Image(object):
 
         utils.execute('fallocate', '-n', '-l', size, path)
 
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        """Create a disk from the output of a function. Used to create
+        ephemeral and swap disks.
+
+        Args:
+            context: The current request context
+            func: A create function which takes a path as its single
+                argument, which will write the initial contents of the new
+                disk.
+            cache_name: A name which can be used as a key to cache the
+                output of the function.
+            size: The size of the disk to create, in bytes.
+            fallback_from_host: If set and the image isn't cached, attempt to
+                side-load it from the cache on this compute host.
+        """
+        raise NotImplementedError()
+
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
         """Creates image from template.
 
@@ -732,6 +750,14 @@ class NoBacking(Image):
                 # Write out the file format to disk.info
                 self.correct_format()
 
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        cache = ImageCacheLocalPool.get()
+        backing = cache.get_cached_func(func, cache_name,
+                                        fallback_from_host=fallback_from_host)
+        with self.import_file(context, imgmodel.FORMAT_RAW, size) as target:
+            libvirt_utils.copy_image(backing, target)
+
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = self._get_lock_name(base)
 
@@ -849,6 +875,17 @@ class Qcow2(Image):
         image = imgmodel.LocalFileImage(self.path, imgmodel.FORMAT_QCOW2)
         disk.extend(image, size)
 
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        # Qcow2 writes the function output to the cache, then creates an
+        # overlay directly on the cached output.
+        cache = ImageCacheLocalPool.get()
+        backing = cache.get_cached_func(func, cache_name,
+                                        fallback_from_host=fallback_from_host)
+
+        with self.lock():
+            libvirt_utils.create_cow_image(backing, self.path)
+
     def snapshot_extract(self, target, out_format):
         libvirt_utils.extract_snapshot(self.path, 'qcow2',
                                        target,
@@ -962,6 +999,13 @@ class Lvm(Image):
                         images.convert_image(tempfile, path, format,
                                              self.driver_format,
                                              run_as_root=True)
+
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        # Note that the Lvm backend doesn't use the image cache when creating
+        # from a function
+        with self.import_file(context, imgmodel.FORMAT_RAW, size) as target:
+            func(target)
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         def encrypt_lvm_image():
@@ -1220,6 +1264,16 @@ class Rbd(Image):
                     self.driver.remove_image(self.rbd_name)
                 self.driver.import_image(import_file, self.rbd_name)
 
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        # Rbd caches the function output to the local image cache,
+        # then imports the output to rbd
+        cache = ImageCacheLocalPool.get()
+        cached = cache.get_cached_func(func, cache_name,
+                                       fallback_from_host=fallback_from_host)
+        with self.lock():
+            self.driver.import_image(cached, self.rbd_name)
+
     def create_snap(self, name):
         return self.driver.create_snap(self.rbd_name, name)
 
@@ -1398,6 +1452,17 @@ class Ploop(Image):
                 self._restore_descriptor(self.path, format, image_path)
                 if size is not None:
                     self.resize_image(size)
+
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        # Ploop caches the function output, then imports the cached output
+        cache = ImageCacheLocalPool.get()
+        cached = cache.get_cached_func(func, cache_name,
+                                       fallback_from_host=fallback_from_host)
+
+        with self.import_file(context, imgmodel.FORMAT_RAW, size) as \
+                import_path:
+            libvirt_utils.copy_image(cached, import_path)
 
     def snapshot_extract(self, target, out_format):
         img_path = os.path.join(self.path, "root.hds")

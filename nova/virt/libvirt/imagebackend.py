@@ -390,6 +390,10 @@ class Image(object):
         """
         raise NotImplementedError()
 
+    def check_backing_from_func(self, func, cache_name,
+                                fallback_from_host=None):
+        pass
+
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
         """Creates image from template.
 
@@ -818,6 +822,24 @@ class Qcow2(Image):
         self.disk_info_path = os.path.join(os.path.dirname(self.path),
                                            'disk.info')
         self.resolve_driver_format()
+
+    def check_backing_from_func(self, func, cache_name,
+                                fallback_from_host=None):
+        backing_path = libvirt_utils.get_disk_backing_file(
+            self.path, imgmodel.FORMAT_QCOW2)
+
+        if backing_path is None:
+            return
+
+        cache_pool = ImageCacheLocalPool.get()
+        if not cache_pool.is_path_in_image_cache(backing_path):
+            raise exception.InvalidDiskFormat(
+                message=_LE('Qcow2 disk has backing file which is not in the '
+                            'image cache'))
+
+        cache_name = os.path.basename(backing_path)
+        cache_pool.get_cached_func(func, cache_name,
+                                   fallback_from_host=fallback_from_host)
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = self._get_lock_name(base)

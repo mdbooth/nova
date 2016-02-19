@@ -1025,6 +1025,77 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
                         model)
 
 
+class Qcow2CheckBackingFromFuncTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(Qcow2CheckBackingFromFuncTestCase, self).setUp()
+
+        self.path = os.path.join('/', uuidutils.generate_uuid())
+        # resolve_driver_format isn't relevant to this test
+        with mock.patch.object(imagebackend.Qcow2, 'resolve_driver_format',
+                               autospec=True):
+            self.disk = imagebackend.Qcow2(path=self.path)
+
+        self.instances_dir = os.path.join('/', uuidutils.generate_uuid())
+        self.cache_dir = os.path.join(self.instances_dir, '_base')
+
+        patcher = mock.patch.object(libvirt_utils, 'get_disk_backing_file',
+                                    autospec=True)
+        self.mock_get_disk_backing_file = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # For initialisation of ImageCacheLocalPool
+        patcher = mock.patch.object(fileutils, 'ensure_tree', autospec=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        patcher = mock.patch.object(imagebackend.ImageCacheLocalPool,
+                                    'get_cached_func', autospec=True)
+        self.mock_get_cached_func = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.flags(instances_path=self.instances_dir)
+
+        self.cache_name = uuidutils.generate_uuid()
+
+        imagebackend.ImageCacheLocalPool.reset()
+
+    def test_check_backing_from_func_no_backing(self):
+        # If the disk has no backing file we should do nothing
+        self.mock_get_disk_backing_file.return_value = None
+
+        # The test that it doesn't raise an exception is implicit
+        self.disk.check_backing_from_func(
+            mock.sentinel.create, self.cache_name,
+            fallback_from_host=mock.sentinel.fallback)
+        self.assertFalse(self.mock_get_cached_func.called)
+
+    def test_check_backing_from_func_invalid_backing_path(self):
+        # We should raise an exception if the disk has a backing file which
+        # isn't in the cache directory.
+        self.mock_get_disk_backing_file.return_value = '/invalid/path'
+
+        self.assertRaises(exception.InvalidDiskFormat,
+                          self.disk.check_backing_from_func,
+                          mock.sentinel.create, self.cache_name,
+                          mock.sentinel.fallback)
+
+    def test_check_backing_from_cache(self):
+        # We should check the cache if we have a valid backing file
+        self.mock_get_disk_backing_file.return_value = os.path.join(
+            self.cache_dir, self.cache_name)
+
+        self.disk.check_backing_from_func(
+            mock.sentinel.create, self.cache_name,
+            fallback_from_host=mock.sentinel.fallback)
+
+        # N.B. behaviour of get_cached_func, including fallback behaviour, is
+        # tested separately
+        self.mock_get_cached_func.assert_called_once_with(
+            imagebackend.ImageCacheLocalPool.get(),
+            mock.sentinel.create, self.cache_name,
+            fallback_from_host=mock.sentinel.fallback)
+
+
 class LvmTestCase(_ImageTestCase, test.NoDBTestCase):
     VG = 'FakeVG'
     TEMPLATE_SIZE = 512

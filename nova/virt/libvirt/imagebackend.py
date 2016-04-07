@@ -48,7 +48,8 @@ from nova.virt.libvirt import utils as libvirt_utils
 __imagebackend_opts = [
     cfg.StrOpt('images_type',
                default='default',
-               choices=('raw', 'qcow2', 'lvm', 'rbd', 'ploop', 'default'),
+               choices=('raw', 'nobacking', 'qcow2', 'lvm', 'rbd', 'ploop',
+                        'default'),
                help='VM Images format. If default is specified, then'
                     ' use_cow_images flag is used instead of this one.'),
     cfg.StrOpt('images_volume_group',
@@ -461,10 +462,15 @@ class Image(object):
         pass
 
 
-class Raw(Image):
+class NoBacking(Image):
+    """The NoBacking backend uses either raw or qcow2 storage. It never uses
+    a backing store, so when using qcow2 it copies an image rather than
+    creating an overlay. By default it creates raw files, but will use qcow2
+    when creating a disk from a qcow2 if force_raw_images is not set in config.
+    """
     def __init__(self, instance=None, disk_name=None, path=None):
         self.disk_name = disk_name
-        super(Raw, self).__init__("file", "raw", is_block_dev=False)
+        super(NoBacking, self).__init__("file", "raw", is_block_dev=False)
 
         self.path = (path or
                      os.path.join(libvirt_utils.get_instance_path(instance),
@@ -490,11 +496,11 @@ class Raw(Image):
 
     def _supports_encryption(self):
         # NOTE(dgenin): Kernel, ramdisk and disk.config are fetched using
-        # the Raw backend regardless of which backend is configured for
-        # ephemeral storage. Encryption for the Raw backend is not yet
+        # the NoBacking backend regardless of which backend is configured for
+        # ephemeral storage. Encryption for the NoBacking backend is not yet
         # implemented so this loophole is necessary to allow other
         # backends already supporting encryption to function. This can
-        # be removed once encryption for Raw is implemented.
+        # be removed once encryption for NoBacking is implemented.
         if self.disk_name not in ['kernel', 'ramdisk', 'disk.config']:
             return False
         else:
@@ -511,7 +517,6 @@ class Raw(Image):
         def copy_raw_image(base, target, size):
             libvirt_utils.copy_image(base, target)
             if size:
-                # class Raw is misnamed, format may not be 'raw' in all cases
                 image = imgmodel.LocalFileImage(target,
                                                 self.driver_format)
                 disk.extend(image, size)
@@ -1100,12 +1105,13 @@ class Ploop(Image):
 class Backend(object):
     def __init__(self, use_cow):
         self.BACKEND = {
-            'raw': Raw,
+            'raw': NoBacking,
+            'nobacking': NoBacking,
             'qcow2': Qcow2,
             'lvm': Lvm,
             'rbd': Rbd,
             'ploop': Ploop,
-            'default': Qcow2 if use_cow else Raw
+            'default': Qcow2 if use_cow else NoBacking
         }
 
     def backend(self, image_type=None):

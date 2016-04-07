@@ -194,14 +194,15 @@ class _ImageTestCase(object):
         get_disk_size.assert_called_once_with(image.path)
 
 
-class RawTestCase(_ImageTestCase, test.NoDBTestCase):
+class NoBackingTestCase(_ImageTestCase, test.NoDBTestCase):
 
     SIZE = 1024
 
     def setUp(self):
-        self.image_class = imagebackend.Raw
-        super(RawTestCase, self).setUp()
-        self.stubs.Set(imagebackend.Raw, 'correct_format', lambda _: None)
+        self.image_class = imagebackend.NoBacking
+        super(NoBackingTestCase, self).setUp()
+        self.stubs.Set(imagebackend.NoBacking, 'correct_format',
+                       lambda _: None)
 
     def prepare_mocks(self):
         fn = self.mox.CreateMockAnything()
@@ -1670,24 +1671,25 @@ class BackendTestCase(test.NoDBTestCase):
         assertIsInstance(image1, image_not_cow)
         assertIsInstance(image2, image_cow)
 
-    def test_image_raw(self):
-        self._test_image('raw', imagebackend.Raw, imagebackend.Raw)
+    def test_image_nobacking(self):
+        self._test_image('raw', imagebackend.NoBacking, imagebackend.NoBacking)
 
-    def test_image_raw_preallocate_images(self):
+    def test_image_nobacking_preallocate_images(self):
         flags = ('space', 'Space', 'SPACE')
         for f in flags:
             self.flags(preallocate_images=f)
-            raw = imagebackend.Raw(self.INSTANCE, 'fake_disk', '/tmp/xyz')
+            raw = imagebackend.NoBacking(self.INSTANCE, 'fake_disk',
+                                         '/tmp/xyz')
             self.assertTrue(raw.preallocate)
 
-    def test_image_raw_preallocate_images_bad_conf(self):
+    def test_image_nobacking_preallocate_images_bad_conf(self):
         self.flags(preallocate_images='space1')
-        raw = imagebackend.Raw(self.INSTANCE, 'fake_disk', '/tmp/xyz')
+        raw = imagebackend.NoBacking(self.INSTANCE, 'fake_disk', '/tmp/xyz')
         self.assertFalse(raw.preallocate)
 
-    def test_image_raw_native_io(self):
+    def test_image_nobacking_native_io(self):
         self.flags(preallocate_images="space")
-        raw = imagebackend.Raw(self.INSTANCE, 'fake_disk', '/tmp/xyz')
+        raw = imagebackend.NoBacking(self.INSTANCE, 'fake_disk', '/tmp/xyz')
         self.assertEqual(raw.driver_io, "native")
 
     def test_image_qcow2(self):
@@ -1733,4 +1735,4 @@ class BackendTestCase(test.NoDBTestCase):
         self._test_image('rbd', imagebackend.Rbd, imagebackend.Rbd)
 
     def test_image_default(self):
-        self._test_image('default', imagebackend.Raw, imagebackend.Qcow2)
+        self._test_image('default', imagebackend.NoBacking, imagebackend.Qcow2)

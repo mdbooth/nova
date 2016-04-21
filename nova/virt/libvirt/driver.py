@@ -3125,22 +3125,10 @@ class LibvirtDriver(driver.ComputeDriver):
                            'kernel_id': instance.kernel_id,
                            'ramdisk_id': instance.ramdisk_id}
 
-        if disk_images['kernel_id']:
-            fname = imagecache.get_cache_fname(disk_images['kernel_id'])
-            raw('kernel').cache(fetch_func=libvirt_utils.fetch_raw_image,
-                                context=context,
-                                filename=fname,
-                                image_id=disk_images['kernel_id'],
-                                user_id=instance.user_id,
-                                project_id=instance.project_id)
-            if disk_images['ramdisk_id']:
-                fname = imagecache.get_cache_fname(disk_images['ramdisk_id'])
-                raw('ramdisk').cache(fetch_func=libvirt_utils.fetch_raw_image,
-                                     context=context,
-                                     filename=fname,
-                                     image_id=disk_images['ramdisk_id'],
-                                     user_id=instance.user_id,
-                                     project_id=instance.project_id)
+        self._fetch_instance_kernel_ramdisk(
+            context, instance,
+            disk_images['kernel_id'], disk_images['ramdisk_id'],
+            fallback_from_host=fallback_from_host)
 
         inst_type = instance.get_flavor()
 
@@ -3188,18 +3176,14 @@ class LibvirtDriver(driver.ComputeDriver):
             backend = image('disk')
             if instance.task_state == task_states.RESIZE_FINISH:
                 backend.create_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
-            if backend.SUPPORTS_CLONE:
-                def clone_fallback_to_fetch(*args, **kwargs):
-                    try:
-                        backend.clone(context, disk_images['image_id'])
-                    except exception.ImageUnacceptable:
-                        libvirt_utils.fetch_image(*args, **kwargs)
-                fetch_func = clone_fallback_to_fetch
-            else:
-                fetch_func = libvirt_utils.fetch_image
-            self._try_fetch_image_cache(backend, fetch_func, context,
-                                        root_fname, disk_images['image_id'],
-                                        instance, size, fallback_from_host)
+            with backend.lock():
+                if backend.exists():
+                    backend.check_backing_from_image(
+                        context, disk_images['image_id'], instance,
+                        fallback_from_host=fallback_from_host)
+                else:
+                    backend.create_from_image(context, disk_images['image_id'],
+                                              instance, size)
 
             if need_inject:
                 self._inject_data(backend, instance, network_info, admin_pass,
@@ -6498,48 +6482,23 @@ class LibvirtDriver(driver.ComputeDriver):
         # the instance
         self.pause(instance)
 
-    def _try_fetch_image(self, context, path, image_id, instance,
-                         fallback_from_host=None):
-        try:
-            libvirt_utils.fetch_image(context, path,
-                                      image_id,
-                                      instance.user_id,
-                                      instance.project_id)
-        except exception.ImageNotFound:
-            if not fallback_from_host:
-                raise
-            LOG.debug("Image %(image_id)s doesn't exist anymore on "
-                      "image service, attempting to copy image "
-                      "from %(host)s",
-                      {'image_id': image_id, 'host': fallback_from_host})
-            libvirt_utils.copy_image(src=path, dest=path,
-                                     host=fallback_from_host,
-                                     receive=True)
-
     def _fetch_instance_kernel_ramdisk(self, context, instance,
+                                       kernel_id, ramdisk_id,
                                        fallback_from_host=None):
         """Download kernel and ramdisk for instance in instance directory."""
-        instance_dir = libvirt_utils.get_instance_path(instance)
-        if instance.kernel_id:
-            kernel_path = os.path.join(instance_dir, 'kernel')
-            # NOTE(dsanders): only fetch image if it's not available at
-            # kernel_path. This also avoids ImageNotFound exception if
-            # the image has been deleted from glance
-            if not os.path.exists(kernel_path):
-                self._try_fetch_image(context,
-                                      kernel_path,
-                                      instance.kernel_id,
-                                      instance, fallback_from_host)
-            if instance.ramdisk_id:
-                ramdisk_path = os.path.join(instance_dir, 'ramdisk')
-                # NOTE(dsanders): only fetch image if it's not available at
-                # ramdisk_path. This also avoids ImageNotFound exception if
-                # the image has been deleted from glance
-                if not os.path.exists(ramdisk_path):
-                    self._try_fetch_image(context,
-                                          ramdisk_path,
-                                          instance.ramdisk_id,
-                                          instance, fallback_from_host)
+
+        for name, image_id in (('kernel', kernel_id), ('ramdisk', ramdisk_id)):
+            # No point checking ramdisk if there's no kernel
+            if image_id is None:
+                break
+
+            # External boot images don't use backing files
+            disk = self.image_backend.image(instance, name,
+                                            image_type='nobacking')
+            with disk.lock():
+                if not disk.exists():
+                    disk.create_from_image(context, image_id, instance, 0,
+                        fallback_from_host=fallback_from_host)
 
     def rollback_live_migration_at_destination(self, context, instance,
                                                network_info,
@@ -6650,7 +6609,9 @@ class LibvirtDriver(driver.ComputeDriver):
 
                 # if image has kernel and ramdisk, just download
                 # following normal way.
-                self._fetch_instance_kernel_ramdisk(context, instance)
+                self._fetch_instance_kernel_ramdisk(
+                    context, instance, instance.kernel_id, instance.ramdisk_id,
+                    fallback_from_host=instance.host)
 
         # Establishing connection to volume server.
         block_device_mapping = driver.block_device_info_get_mapping(
@@ -6720,34 +6681,6 @@ class LibvirtDriver(driver.ComputeDriver):
 
         return migrate_data
 
-    def _try_fetch_image_cache(self, image, fetch_func, context, filename,
-                               image_id, instance, size,
-                               fallback_from_host=None):
-        try:
-            image.cache(fetch_func=fetch_func,
-                        context=context,
-                        filename=filename,
-                        image_id=image_id,
-                        user_id=instance.user_id,
-                        project_id=instance.project_id,
-                        size=size)
-        except exception.ImageNotFound:
-            if not fallback_from_host:
-                raise
-            LOG.debug("Image %(image_id)s doesn't exist anymore "
-                      "on image service, attempting to copy "
-                      "image from %(host)s",
-                      {'image_id': image_id, 'host': fallback_from_host},
-                      instance=instance)
-
-            def copy_from_host(target, max_size):
-                libvirt_utils.copy_image(src=target,
-                                         dest=target,
-                                         host=fallback_from_host,
-                                         receive=True)
-            image.cache(fetch_func=copy_from_host,
-                        filename=filename)
-
     def _create_images_and_backing(self, context, instance, instance_dir,
                                    disk_info, fallback_from_host=None):
         """:param context: security context
@@ -6799,18 +6732,15 @@ class LibvirtDriver(driver.ComputeDriver):
                     image.check_backing_from_func(create_func, cache_name,
                           fallback_from_host=fallback_from_host)
                 else:
-                    self._try_fetch_image_cache(image,
-                                                libvirt_utils.fetch_image,
-                                                context, cache_name,
-                                                instance.image_ref,
-                                                instance,
-                                                info['virt_disk_size'],
-                                                fallback_from_host)
+                    image.check_backing_from_image(
+                        context, instance.image_ref, instance,
+                        fallback_from_host=fallback_from_host)
 
         # if image has kernel and ramdisk, just download
         # following normal way.
         self._fetch_instance_kernel_ramdisk(
-            context, instance, fallback_from_host=fallback_from_host)
+            context, instance, instance.kernel_id, instance.ramdisk_id,
+            fallback_from_host=fallback_from_host)
 
     def post_live_migration(self, context, instance, block_device_info,
                             migrate_data=None):

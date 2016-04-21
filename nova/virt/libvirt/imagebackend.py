@@ -394,7 +394,7 @@ class Image(object):
                                 fallback_from_host=None):
         pass
 
-    def create_from_image(self, context, image_id, instance, size=None,
+    def create_from_image(self, context, image_id, instance, size,
                           fallback_from_host=None):
         raise NotImplementedError()
 

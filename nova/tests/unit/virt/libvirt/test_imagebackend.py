@@ -806,6 +806,9 @@ class NoBackingImportFileTestCase(test.NoDBTestCase):
         self.assertRaises(NotImplementedError, _test)
 
 
+class NoBackingCreateFromImageTestCase(test.NoDBTestCase):
+    def setUp(self):
+
 class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
     SIZE = units.Gi
 

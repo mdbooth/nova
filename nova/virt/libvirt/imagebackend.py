@@ -398,6 +398,10 @@ class Image(object):
                           fallback_from_host=None):
         raise NotImplementedError()
 
+    def check_backing_from_image(self, context, image_id, instance,
+                                 fallback_from_host=None):
+        pass
+
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
         """Creates image from template.
 

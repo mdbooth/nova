@@ -786,7 +786,7 @@ class NoBacking(Image):
             libvirt_utils.copy_image(cached_image.path, target)
 
             # Resize the disk if required
-            if size > 0:
+            if size > cached_image.virtual_size:
                 image = imgmodel.LocalFileImage(target, self.driver_format)
                 disk.extend(image, size)
 

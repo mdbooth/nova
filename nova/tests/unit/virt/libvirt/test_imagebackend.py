@@ -808,6 +808,68 @@ class NoBackingImportFileTestCase(test.NoDBTestCase):
 
 class NoBackingCreateFromImageTestCase(test.NoDBTestCase):
     def setUp(self):
+        super(NoBackingCreateFromImageTestCase, self).setUp()
+
+        self.context = mock.sentinel.context
+        self.image_id = uuidutils.generate_uuid()
+        self.instance = mock.sentinel.instance
+        self.fallback_host = mock.sentinel.fallback_host
+
+        self.import_path = '/import/path'
+        self.instances_path = '/instances'
+        self.flags(instances_path=self.instances_path)
+        self.disk_size = units.Gi
+
+        @contextlib.contextmanager
+        def fake_import_file(fake_self, context, format, size):
+            self.assertEqual(self.context, context)
+            self.assertEqual(self.disk_size, size)
+
+            yield self.import_path
+
+        # Mock import file for all tests, call fake_import_file
+        patcher = mock.patch.object(
+            imagebackend.NoBacking, 'import_file', fake_import_file)
+        self.mock_import_file = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # Mock ImageCacheLocalPool.get for all tests
+        patcher = mock.patch.object(imagebackend.ImageCacheLocalPool, 'get')
+        mock_image_cache_get = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        mock_image_cache = mock_image_cache_get.return_value
+        self.mock_get_cached_image = mock_image_cache.get_cached_image
+
+        # Default CachedImageInfo, can be tweaked before return
+        self.cached_image_info = imagebackend.CachedImageInfo(
+            '/image/cache', imgmodel.FORMAT_RAW, units.Gi, units.Gi)
+        self.mock_get_cached_image.return_value = self.cached_image_info
+
+        # Mock libvirt copy_image
+        patcher = mock.patch.object(libvirt_utils, 'copy_image', autospec=True)
+        self.mock_copy_image = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # The disk
+        self.path = os.path.join(self.instances_path,
+                                 uuidutils.generate_uuid())
+        self.disk = imagebackend.NoBacking(path=self.path)
+
+    def test_success_raw(self):
+        self.disk.create_from_image(
+            self.context, self.image_id, self.instance, self.disk_size,
+            fallback_from_host=self.fallback_host)
+
+        self.mock_get_cached_image.assert_called_once_with(
+            self.context, self.image_id, self.instance,
+            fallback_from_host=mock.sentinel.fallback_from_host)
+        self.mock_import_file.assert_called_once_with(
+            self.context, self.cached_image_info.file_format,
+            self.cached_image_info.virtual_size)
+
+        
+
 
 class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
     SIZE = units.Gi

@@ -1000,15 +1000,6 @@ class Rbd(Image):
     def exists(self):
         return self.driver.exists(self.rbd_name)
 
-    @contextlib.contextmanager
-    def remove_volume_on_error(self):
-        try:
-            yield
-        except Exception:
-            with excutils.save_and_reraise_exception(), self.lock():
-                if self.exists():
-                    self.driver.remove_image(self.rbd_name)
-
     def get_disk_size(self, name):
         """Returns the size of the virtual disk in bytes.
 
@@ -1085,45 +1076,58 @@ class Rbd(Image):
 
     def create_from_func(self, context, func, cache_name, size,
                          fallback_from_host=None):
-        # Rbd caches the function output to the local image cache,
-        # then imports the output to rbd
         cache = ImageCacheLocalPool.get()
-        cached = cache.get_cached_func(func, cache_name,
-                                       fallback_from_host=fallback_from_host)
-        with self.lock():
-            self.driver.import_image(cached, self.rbd_name)
+        cached_path = cache.get_cached_func(
+            func, cache_name, fallback_from_host=fallback_from_host)
 
-    def create_from_image(self, context, image_id, instance, size,
+        with self._import() as target:
+            self.driver.import_image(cached_path, target)
+
+    def create_from_image(self, context, image_id, size,
                           fallback_from_host=None):
+        if self._clone_from_glance_location(context, image_id, size):
+            return
+
+        imagecache_pool = ImageCacheLocalPool.get()
+        cached_image = imagecache_pool.get_cached_image(
+            context, image_id, fallback_from_host=fallback_from_host)
+        self.verify_base_size(None, size, cached_image.virtual_size)
+
+        with self._import() as target:
+            self.driver.import_image(cached_image.path, target)
+            if size and size > cached_image.virtual_size:
+                self.resize_image(size)
+
+    @contextlib.contextmanager
+    def _import(self):
+        with self.lock():
+            with self.remove_volume_on_error():
+                yield self.rbd_name  # instance-uuid_some-disk
+
+    def _clone_from_glance_location(self, context, image_id, size):
         image_meta = IMAGE_API.get(context, image_id, include_locations=True)
         locations = image_meta['locations']
-
-        # Look for a cloneable glance location
         for location in locations:
             if self.driver.is_cloneable(location, image_meta):
-                with self.remove_volume_on_error():
-                    with self.lock():
+                with self.lock():
+                    with self.remove_volume_on_error():
                         self.driver.clone(location, self.rbd_name)
 
-                    # Check the size of the cloned disk.
-                    # TODO(mdbooth): It would be better to check this before
-                    # cloning the disk, but we'd need some additional
-                    # methods in rbd_utils.
-                    disk_size = self.driver.size(self.rbd_name)
-                    self.verify_base_size(None, size, disk_size)
-                    break
+                        # Check the size of the cloned disk.
+                        # TODO(mdbooth): It would be better to check this
+                        # before cloning the disk, but we'd need some
+                        # additional methods in rbd_utils.
+                        self.verify_base_size(self.rbd_name, size)
+                        return location
 
-        # We didn't find a cloneable glance location, so download to the
-        # local image cache and import it.
-        else:
-            imagecache_pool = ImageCacheLocalPool.get()
-            cached_image = imagecache_pool.get_cached_image(
-                context, image_id, instance,
-                fallback_from_host=fallback_from_host)
-            self.verify_base_size(None, size, cached_image.virtual_size)
-
-            with self.lock():
-                self.driver.import_image(cached_image.path, self.rbd_name)
+    @contextlib.contextmanager
+    def remove_volume_on_error(self):
+        try:
+            yield
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                if self.exists():
+                    self.driver.remove_image(self.rbd_name)
 
     def create_snap(self, name):
         return self.driver.create_snap(self.rbd_name, name)

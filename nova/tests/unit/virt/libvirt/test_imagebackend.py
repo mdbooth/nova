@@ -1897,6 +1897,88 @@ class PloopTestCase(_ImageTestCase, test.NoDBTestCase):
         super(PloopTestCase, self).setUp()
         self.utils = imagebackend.utils
 
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagebackend.ImageCacheLocalPool, 'get_cached_func')
+    def test_create_from_func(self, mock_cache, mock_copy):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        target = os.path.join(self.PATH, 'root.hds')
+        mock_cache.return_value = mock.sentinel.path
+        with self._ploop_command_mocks(should_resize=False):
+            image.create_from_func(
+                self.CONTEXT, mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.size, mock.sentinel.fallback)
+            mock_copy.assert_called_once_with(mock.sentinel.path, target)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagebackend.ImageCacheLocalPool, 'get_cached_image')
+    def test_create_from_image_success(self, mock_cache, mock_copy):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        target = os.path.join(self.PATH, 'root.hds')
+        mock_cache.return_value = imagebackend.CachedImageInfo(
+            mock.sentinel.path, None, 99, None)
+        size = 100  # flavor root disk size (100) > virtual disk size (99)
+        with self._ploop_command_mocks(should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_copy.assert_called_once_with(mock.sentinel.path, target)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagebackend.ImageCacheLocalPool, 'get_cached_image')
+    def test_create_from_image_error(self, mock_cache, mock_copy):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = imagebackend.CachedImageInfo(
+            mock.sentinel.path, None, 100, None)
+        size = 99  # flavor root disk size (99) < virtual disk size (100)
+        self.assertRaises(
+            exception.FlavorDiskSmallerThanImage, image.create_from_image,
+            self.CONTEXT, mock.sentinel.image_id, size)
+        self.assertEqual(0, mock_copy.call_count)
+
+    @mock.patch.object(imagebackend.IMAGE_API, 'get')
+    def test_create_from_image_format_raw(self, mock_get):
+        CONF.set_override('force_raw_images', False)
+        mock_get.return_value = {'disk_format': 'raw'}
+        self._test_create_from_image_format_success()
+
+    @mock.patch.object(imagebackend.IMAGE_API, 'get')
+    def test_create_from_image_format_ploop(self, mock_get):
+        CONF.set_override('force_raw_images', False)
+        mock_get.return_value = {'disk_format': 'ploop'}
+        self._test_create_from_image_format_success()
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagebackend.ImageCacheLocalPool, 'get_cached_image')
+    def _test_create_from_image_format_success(self, mock_cache, mock_copy):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        target = os.path.join(self.PATH, 'root.hds')
+        mock_cache.return_value = imagebackend.CachedImageInfo(
+            mock.sentinel.path, None, 99, None)
+        size = 100  # flavor root disk size (100) > virtual disk size (99)
+        with self._ploop_command_mocks(should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_copy.assert_called_once_with(mock.sentinel.path, target)
+
+    @mock.patch.object(imagebackend.IMAGE_API, 'get')
+    def test_create_from_image_format_error(self, mock_get):
+        CONF.set_override('force_raw_images', False)
+        mock_get.return_value = {'disk_format': mock.sentinel.bad_format}
+        image = self.image_class(self.INSTANCE, self.NAME)
+        self.assertRaises(
+            exception.ImageUnacceptable, image.create_from_image, self.CONTEXT,
+            mock.sentinel.image_id, mock.sentinel.size)
+
+    @contextlib.contextmanager
+    def _ploop_command_mocks(self, should_resize):
+        with test.nested(
+            mock.patch.object(imagebackend.Ploop, 'resize_image'),
+            mock.patch.object(imagebackend.Ploop, '_restore_descriptor')
+        ) as (mock_resize, mock_restore):
+            yield
+            self.assertEqual(1, mock_restore.call_count)
+            if should_resize:
+                self.assertEqual(1, mock_resize.call_count)
+            else:
+                self.assertEqual(0, mock_resize.call_count)
+
     def prepare_mocks(self):
         fn = self.mox.CreateMockAnything()
         self.mox.StubOutWithMock(imagebackend.utils.synchronized,
@@ -1956,96 +2038,6 @@ class PloopTestCase(_ImageTestCase, test.NoDBTestCase):
         self.stubs.Set(image, 'get_disk_size', lambda _: self.SIZE)
 
         image.cache(fake_fetch, self.TEMPLATE_PATH, self.SIZE)
-
-
-class PloopImportFileTestCase(test.NoDBTestCase):
-    def setUp(self):
-        super(PloopImportFileTestCase, self).setUp()
-
-        mocks = {
-            'resolve_driver_format': (imagebackend.Ploop,
-                                      'resolve_driver_format'),
-            'restore_descriptor': (imagebackend.Ploop, '_restore_descriptor'),
-            'resize_image': (imagebackend.Ploop, 'resize_image')
-        }
-        self.helper = self.useFixture(ImportFileFixture(self, mocks))
-
-        tempdir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tempdir)
-
-        self.path = os.path.join(tempdir, uuidutils.generate_uuid())
-
-    def test_import_file(self):
-        disk = imagebackend.Ploop(path=self.path)
-
-        root_hds = os.path.join(self.path, 'root.hds')
-
-        with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
-                              self.helper.test_size) as import_file:
-            self.helper.assert_disk_locked(disk)
-
-            # Create the import file
-            with open(import_file, 'w'):
-                pass
-
-        self.helper.assert_disk_locked(disk, False)
-
-        # The disk path should exist, and be a directory
-        self.assertTrue(os.path.isdir(self.path))
-
-        # It should contain root.hds
-        self.assertTrue(os.path.isfile(root_hds))
-
-        self.helper.mock_restore_descriptor.assert_called_once_with(
-            disk, self.path, imgmodel.FORMAT_RAW, root_hds)
-
-        self.helper.mock_resize_image.assert_called_once_with(
-            disk, self.helper.test_size)
-
-    def test_import_file_ploop(self):
-        disk = imagebackend.Ploop(path=self.path)
-
-        root_hds = os.path.join(self.path, 'root.hds')
-
-        with disk.import_file(mock.sentinel.context, 'ploop',
-                              self.helper.test_size):
-            pass
-
-        # We should have called ploop restore-descriptor with the
-        # correct format
-        self.helper.mock_restore_descriptor.assert_called_once_with(
-            disk, self.path, 'ploop', root_hds)
-
-    def test_import_file_unsupported(self):
-        disk = imagebackend.Ploop(path=self.path)
-
-        def _test():
-            with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_QCOW2,
-                                  self.helper.test_size):
-                pass
-
-        self.assertRaises(NotImplementedError, _test)
-
-    def test_import_file_cleanup_on_error(self):
-        class FakeException(Exception):
-            pass
-
-        disk = imagebackend.Ploop(path=self.path)
-
-        try:
-            with disk.import_file(mock.sentinel.context, imgmodel.FORMAT_RAW,
-                                  self.helper.test_size) as import_file:
-                # Ensure that import_file exists
-                with open(import_file, 'w'):
-                    pass
-                self.assertTrue(os.path.isfile(import_file))
-
-                raise FakeException()
-        except FakeException:
-            pass
-
-        # Ensure that import_file no longer exists
-        self.assertFalse(os.path.isfile(import_file))
 
 
 class BackendTestCase(test.NoDBTestCase):

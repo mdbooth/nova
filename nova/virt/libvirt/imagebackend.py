@@ -1237,6 +1237,11 @@ class Ploop(Image):
     def create_image(self, prepare_template, base, size, *args, **kwargs):
         filename = os.path.split(base)[-1]
 
+        #       base: instances/_base/sha1-image-uuid
+        #       path: instances/instance-uuid/disk
+        #     target: instances/instance-uuid/disk
+        # image_path: instances/instance-uuid/disk/root.hds
+
         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
         def create_ploop_image(base, target, size):
             image_path = os.path.join(target, "root.hds")
@@ -1284,64 +1289,62 @@ class Ploop(Image):
         utils.execute('ploop', 'grow', '-s', '%dK' % (size >> 10), dd_path,
                       run_as_root=True)
 
-    def _restore_descriptor(self, path, format, image_path):
-        utils.execute('ploop', 'restore-descriptor', '-f', format,
+    def _restore_descriptor(self, path, pcs_format, image_path):
+        utils.execute('ploop', 'restore-descriptor', '-f', pcs_format,
                       path, image_path)
-
-    @contextlib.contextmanager
-    def import_file(self, context, format, size=None):
-        if format not in (imgmodel.FORMAT_RAW, 'ploop'):
-            raise NotImplementedError('Ploop can only import raw and ploop')
-
-        with self.lock():
-            remove_func = functools.partial(fileutils.delete_if_exists,
-                                            remove=shutil.rmtree)
-            with fileutils.remove_path_on_error(self.path, remove=remove_func):
-                fileutils.ensure_tree(self.path)
-                image_path = os.path.join(self.path, "root.hds")
-                yield image_path
-                self._restore_descriptor(self.path, format, image_path)
-                if size is not None:
-                    self.resize_image(size)
 
     def create_from_func(self, context, func, cache_name, size,
                          fallback_from_host=None):
-        # Ploop caches the function output, then imports the cached output
         cache = ImageCacheLocalPool.get()
-        cached = cache.get_cached_func(func, cache_name,
-                                       fallback_from_host=fallback_from_host)
+        cached_path = cache.get_cached_func(
+            func, cache_name, fallback_from_host=fallback_from_host)
 
-        with self.import_file(context, imgmodel.FORMAT_RAW, size) as \
-                import_path:
-            libvirt_utils.copy_image(cached, import_path)
+        with self._import(pcs_format='raw') as target:
+            libvirt_utils.copy_image(cached_path, target)
 
-    def create_from_image(self, context, image_id, instance, size,
+    def create_from_image(self, context, image_id, size,
                           fallback_from_host=None):
-        if CONF.force_raw_images:
-            pcs_format = "raw"
-        else:
-            image_meta = IMAGE_API.get(context, image_id)
-            format = image_meta.get("disk_format")
-            if format == "ploop":
-                pcs_format = "expanded"
-            elif format == "raw":
-                pcs_format = "raw"
-            else:
-                reason = _("PCS doesn't support images in %s format."
-                           " You should either set force_raw_images=True"
-                           " in config or upload an image in ploop"
-                           " or raw format.") % format
-                raise exception.ImageUnacceptable(
-                    image_id=image_id, reason=reason)
+        pcs_format = self._verify_pcs_format(context, image_id)
 
         imagecache_pool = ImageCacheLocalPool.get()
         cached_image = imagecache_pool.get_cached_image(
-            context, image_id, instance,
-            fallback_from_host=fallback_from_host)
+            context, image_id, fallback_from_host=fallback_from_host)
         self.verify_base_size(None, size, cached_image.virtual_size)
 
-        with self.import_file(context, pcs_format, size) as target:
+        with self._import(pcs_format) as target:
             libvirt_utils.copy_image(cached_image.path, target)
+            if size and size > cached_image.virtual_size:
+                self.resize_image(size)
+
+    @contextlib.contextmanager
+    def _import(self, pcs_format):
+        target = os.path.join(self.path, 'root.hds')
+        remove_func = functools.partial(
+            fileutils.delete_if_exists, remove=shutil.rmtree)
+
+        with self.lock():
+            with fileutils.remove_path_on_error(self.path, remove=remove_func):
+                fileutils.ensure_tree(self.path)
+                yield target  # /instances/instance-uuid/some-disk/root.hds
+                self._restore_descriptor(self.path, pcs_format, target)
+
+    def _verify_pcs_format(self, context, image_id):
+        if CONF.force_raw_images:
+            pcs_format = 'raw'
+        else:
+            image_meta = IMAGE_API.get(context, image_id)
+            disk_format = image_meta.get('disk_format')
+            if disk_format == 'ploop':
+                pcs_format = 'expanded'
+            elif disk_format == 'raw':
+                pcs_format = 'raw'
+            else:
+                reason = _("PCS doesn't support images in %s format. You"
+                    " should either set force_raw_images=True in config or"
+                    " upload an image in ploop or raw format.") % disk_format
+                raise exception.ImageUnacceptable(
+                    image_id=image_id, reason=reason)
+        return pcs_format
 
     def snapshot_extract(self, target, out_format):
         img_path = os.path.join(self.path, "root.hds")

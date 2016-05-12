@@ -8330,17 +8330,11 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 mock.call(context=self.context,
                           target=backfile_path,
                           image_id=self.test_instance['image_ref'],
-                          user_id=self.test_instance['user_id'],
-                          project_id=self.test_instance['project_id'],
                           max_size=25165824),
                 mock.call(self.context, kernel_path,
-                          self.test_instance['kernel_id'],
-                          self.test_instance['user_id'],
-                          self.test_instance['project_id']),
+                          self.test_instance['kernel_id']),
                 mock.call(self.context, ramdisk_path,
-                          self.test_instance['ramdisk_id'],
-                          self.test_instance['user_id'],
-                          self.test_instance['project_id']),
+                          self.test_instance['ramdisk_id']),
             ])
 
     @mock.patch.object(libvirt_driver.libvirt_utils, 'fetch_image')
@@ -15234,9 +15228,7 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 fetch_func=mock.ANY,
                 filename=mock.ANY,
                 image_id=mock.ANY,
-                project_id=mock.ANY,
-                size=None,
-                user_id=mock.ANY)
+                size=None)
 
         return (mock_image, images)
 

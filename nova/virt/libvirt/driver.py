@@ -6253,10 +6253,7 @@ class LibvirtDriver(driver.ComputeDriver):
     def _try_fetch_image(self, context, path, image_id, instance,
                          fallback_from_host=None):
         try:
-            libvirt_utils.fetch_image(context, path,
-                                      image_id,
-                                      instance.user_id,
-                                      instance.project_id)
+            libvirt_utils.fetch_image(context, path, image_id)
         except exception.ImageNotFound:
             if not fallback_from_host:
                 raise
@@ -6480,8 +6477,6 @@ class LibvirtDriver(driver.ComputeDriver):
                         context=context,
                         filename=filename,
                         image_id=image_id,
-                        user_id=instance.user_id,
-                        project_id=instance.project_id,
                         size=size)
         except exception.ImageNotFound:
             if not fallback_from_host:

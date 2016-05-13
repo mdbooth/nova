@@ -331,6 +331,12 @@ class Image(object):
     def exists(self):
         return os.path.exists(self.path)
 
+    def preallocate_disk(self, size, path=None):
+        if path is None:
+            path = self.path
+
+        utils.execute('fallocate', '-n', '-l', size, path)
+
     def create_from_func(self, context, func, cache_name, size,
                          fallback_from_host=None):
         """Create a disk from the output of a function. Used to create
@@ -387,7 +393,7 @@ class Image(object):
 
             if (self.preallocate and self._can_fallocate() and
                     os.access(self.path, os.W_OK)):
-                utils.execute('fallocate', '-n', '-l', size, self.path)
+                self.preallocate_disk(size)
 
     def _can_fallocate(self):
         """Check once per class, whether fallocate(1) is available,
@@ -702,6 +708,71 @@ class NoBacking(Image):
                     copy_raw_image(base, self.path, size)
 
         self.correct_format()
+
+    @contextlib.contextmanager
+    def import_file(self, context, format, size=0):
+        # We haven't implemented format conversion when importing raw,
+        # because nothing currently uses it.
+        if format != imgmodel.FORMAT_RAW:
+            raise NotImplementedError()
+
+        @contextlib.contextmanager
+        def _create_and_cleanup_on_error():
+            with fileutils.remove_path_on_error(self.path):
+                # Create a sparse output file of the correct size
+                # Ideally we'd fallocate it here, but some operations will
+                # truncate or overwrite the file, so we'd lose it. Instead,
+                # we create a placeholder for operations which require it,
+                # and fallocate afterwards.
+                libvirt_utils.create_image(format, self.path, size)
+                yield
+
+        @contextlib.contextmanager
+        def _no_cleanup():
+            yield
+
+        with self.lock():
+            # Be sure we reuse any existing file, and don't delete an
+            # existing file on error.
+            cleanup = _no_cleanup \
+                if self.exists() else _create_and_cleanup_on_error
+
+            with cleanup():
+                yield self.path
+
+                if self.preallocate and self._can_fallocate():
+                    self.preallocate_disk(size)
+
+                # Write out the file format to disk.info
+                self.correct_format()
+
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        cache = ImageCacheLocalPool.get()
+        backing = cache.get_cached_func(func, cache_name,
+                                        fallback_from_host=fallback_from_host)
+        with self.import_file(context, imgmodel.FORMAT_RAW, size) as target:
+            libvirt_utils.copy_image(backing, target)
+
+    def create_from_image(self, context, image_id, instance, size,
+                          fallback_from_host=None):
+        # Get the image from the local image cache, downloading if necessary.
+        imagecache_pool = ImageCacheLocalPool.get()
+        cached_image = imagecache_pool.get_cached_image(
+                context, image_id, instance,
+                fallback_from_host=fallback_from_host)
+
+        # Ensure that the disk is big enough for the image
+        self.verify_base_size(None, size, cached_image.virtual_size)
+
+        with self.import_file(context, imgmodel.FORMAT_RAW, size) as target:
+            # Copy the cached image
+            libvirt_utils.copy_image(cached_image.path, target)
+
+            # Resize the disk if required
+            if size > cached_image.virtual_size:
+                image = imgmodel.LocalFileImage(target, self.driver_format)
+                disk.extend(image, size)
 
     def resize_image(self, size):
         image = imgmodel.LocalFileImage(self.path, self.driver_format)

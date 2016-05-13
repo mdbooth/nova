@@ -526,6 +526,60 @@ class NoBackingTestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.StubOutWithMock(imagebackend.disk, 'extend')
         return fn
 
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagebackend.ImageCacheLocalPool, 'get_cached_func')
+    def test_create_from_func(self, mock_cache, mock_copy):
+        CONF.set_override('preallocate_images', 'space')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = mock.sentinel.path
+        with self._import_mocks(image, should_resize=False):
+            image.create_from_func(
+                self.CONTEXT, mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.size, mock.sentinel.fallback)
+            mock_copy.assert_called_once_with(mock.sentinel.path, self.PATH)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagebackend.ImageCacheLocalPool, 'get_cached_image')
+    def test_create_from_image_success(self, mock_cache, mock_copy):
+        CONF.set_override('preallocate_images', 'space')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = imagebackend.CachedImageInfo(
+            mock.sentinel.path, None, 99, None)
+        size = 100  # flavor root disk size (100) > virtual disk size (99)
+        with self._import_mocks(image, should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_copy.assert_called_once_with(mock.sentinel.path, self.PATH)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagebackend.ImageCacheLocalPool, 'get_cached_image')
+    def test_create_from_image_error(self, mock_cache, mock_copy):
+        CONF.set_override('preallocate_images', 'space')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = imagebackend.CachedImageInfo(
+            mock.sentinel.path, None, 100, None)
+        size = 99  # flavor root disk size (99) < virtual disk size (100)
+        self.assertRaises(
+            exception.FlavorDiskSmallerThanImage, image.create_from_image,
+            self.CONTEXT, mock.sentinel.image_id, size)
+        self.assertEqual(0, mock_copy.call_count)
+
+    @contextlib.contextmanager
+    def _import_mocks(self, image, should_resize):
+        with test.nested(
+            mock.patch('nova.virt.disk.api.extend'),
+            mock.patch.object(image, '_can_fallocate'),
+            mock.patch.object(image, 'preallocate_disk'),
+            mock.patch.object(image, 'correct_format'),
+        ) as (mock_resize, mock_can_fallocate, mock_preallocate, mock_correct):
+            mock_can_fallocate.return_value = True
+            yield
+            if should_resize:
+                self.assertEqual(1, mock_resize.call_count)
+            else:
+                self.assertEqual(0, mock_resize.call_count)
+            self.assertEqual(1, mock_preallocate.call_count)
+            self.assertEqual(1, mock_correct.call_count)
+
     def test_cache(self):
         self.mox.StubOutWithMock(os.path, 'exists')
         if self.OLD_STYLE_INSTANCE_PATH:

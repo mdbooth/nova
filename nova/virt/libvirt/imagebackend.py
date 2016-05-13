@@ -331,6 +331,27 @@ class Image(object):
     def exists(self):
         return os.path.exists(self.path)
 
+    def create_from_func(self, context, func, cache_name, size,
+                         fallback_from_host=None):
+        """Create a disk from the output of a function. Used to create
+        ephemeral and swap disks.
+        Args:
+            context: The current request context
+            func: A create function which takes a path as its single
+                argument, which will write the initial contents of the new
+                disk.
+            cache_name: A name which can be used as a key to cache the
+                output of the function.
+            size: The size of the disk to create, in bytes.
+            fallback_from_host: If set and the image isn't cached, attempt to
+                side-load it from the cache on this compute host.
+        """
+        raise NotImplementedError()
+
+    def create_from_image(self, context, image_id, size,
+                          fallback_from_host=None):
+        raise NotImplementedError()
+
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
         """Creates image from template.
 

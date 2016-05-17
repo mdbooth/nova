@@ -1192,6 +1192,133 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.StubOutWithMock(rbd_utils, 'rbd')
         self.mox.StubOutWithMock(rbd_utils, 'rados')
 
+    def test_remove_volume_on_error_exists_true(self):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        name = '%s_%s' % (self.INSTANCE.uuid, self.NAME)
+
+        @mock.patch.object(image, 'exists')
+        @mock.patch.object(image.driver, 'remove_image')
+        def _test(mock_remove, mock_exists):
+            mock_exists.return_value = True
+            try:
+                with image.remove_volume_on_error():
+                    raise test.TestingException('should re-raise')
+            except test.TestingException:
+                mock_remove.assert_called_once_with(name)
+            else:
+                raise Exception('Expected TestingException')
+        _test()
+
+    def test_remove_volume_on_error_exists_false(self):
+        image = self.image_class(self.INSTANCE, self.NAME)
+
+        @mock.patch.object(image, 'exists')
+        @mock.patch.object(image.driver, 'remove_image')
+        def _test(mock_remove, mock_exists):
+            mock_exists.return_value = False
+            try:
+                with image.remove_volume_on_error():
+                    raise test.TestingException('should re-raise')
+            except test.TestingException:
+                self.assertEqual(0, mock_remove.call_count)
+            else:
+                raise Exception('Expected TestingException')
+        _test()
+
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    @mock.patch.object(rbd_utils.RBDDriver, 'import_image')
+    def test_create_from_func(self, mock_import, mock_cache):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        name = '%s_%s' % (self.INSTANCE.uuid, self.NAME)
+        mock_cache.return_value = mock.sentinel.path
+        with self._resize_mock(image, should_resize=False):
+            image.create_from_func(
+                self.CONTEXT, mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.size, mock.sentinel.fallback)
+            mock_import.assert_called_once_with(mock.sentinel.path, name)
+
+    @mock.patch.object(rbd_utils.RBDDriver, 'import_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_success(self, mock_cache, mock_import):
+        name = '%s_%s' % (self.INSTANCE.uuid, self.NAME)
+        image, size = self._flavor_disk_larger_than_image(
+            mock_cache, mock.sentinel.path)
+        with self._create_mocks(image):
+            with self._resize_mock(image, should_resize=True):
+                image.create_from_image(
+                    self.CONTEXT, mock.sentinel.image_id, size)
+                mock_import.assert_called_once_with(mock.sentinel.path, name)
+
+    @mock.patch.object(rbd_utils.RBDDriver, 'import_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_error(self, mock_cache, mock_import):
+        image, size = self._flavor_disk_smaller_than_image(
+            mock_cache, mock.sentinel.path)
+        with self._create_mocks(image):
+            self.assertRaises(
+                exception.FlavorDiskSmallerThanImage, image.create_from_image,
+                self.CONTEXT, mock.sentinel.image_id, size)
+            self.assertEqual(0, mock_import.call_count)
+
+    @mock.patch.object(rbd_utils.RBDDriver, 'clone')
+    def test_create_from_image_clone_success(self, mock_clone):
+        size = 100  # flavor root disk size (100) > virtual disk size (99)
+        with self._clone_mocks(99) as [image, name, url]:
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_clone.assert_called_once_with(url, name)
+
+    @mock.patch.object(rbd_utils.RBDDriver, 'clone')
+    @mock.patch.object(rbd_utils.RBDDriver, 'remove_image')
+    def test_create_from_image_clone_error(self, mock_remove, mock_clone):
+        size = 99  # flavor root disk size (99) < virtual disk size (100)
+        with self._clone_mocks(100) as [image, name, url]:
+            self.assertRaises(
+                exception.FlavorDiskSmallerThanImage, image.create_from_image,
+                self.CONTEXT, mock.sentinel.image_id, size)
+            mock_clone.assert_called_once_with(url, name)
+            mock_remove.assert_called_once_with(name)  # rollback on error
+
+    @contextlib.contextmanager
+    def _resize_mock(self, image, should_resize):
+        with mock.patch.object(image.driver, 'resize') as mock_resize:
+            yield
+            if should_resize:
+                self.assertEqual(1, mock_resize.call_count)
+            else:
+                self.assertEqual(0, mock_resize.call_count)
+
+    @contextlib.contextmanager
+    def _create_mocks(self, image):
+        url1 = {'url': mock.sentinel.url1}
+        url2 = {'url': mock.sentinel.url2}
+        with test.nested(
+            mock.patch.object(image.driver, 'is_cloneable'),
+            mock.patch.object(imagebackend.IMAGE_API, 'get'),
+        ) as (mock_cloneable, mock_get):
+            mock_get.return_value = {'locations': [url1, url2]}
+            mock_cloneable.side_effect = [False, False]  # none cloneable
+            yield
+
+    @contextlib.contextmanager
+    def _clone_mocks(self, size):
+        name = '%s_%s' % (self.INSTANCE.uuid, self.NAME)
+        image = self.image_class(self.INSTANCE, self.NAME)
+        url1 = {'url': mock.sentinel.url1}
+        url2 = {'url': mock.sentinel.url2}
+        with test.nested(
+            mock.patch.object(image, 'exists'),
+            mock.patch.object(image, 'get_disk_size'),
+            mock.patch.object(image.driver, 'resize'),
+            mock.patch.object(image.driver, 'is_cloneable'),
+            mock.patch.object(imagebackend.IMAGE_API, 'get')
+        ) as (mock_exists, mock_size, mock_resize, mock_cloneable, mock_get):
+            mock_get.return_value = {'locations': [url1, url2]}
+            mock_cloneable.side_effect = [False, True]  # 2nd is cloneable
+            mock_size.return_value = size
+            mock_exists.return_value = True
+            yield image, name, url2
+            self.assertEqual(0, mock_resize.call_count)
+
     def test_cache(self):
         image = self.image_class(self.INSTANCE, self.NAME)
 

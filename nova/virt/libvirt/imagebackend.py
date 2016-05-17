@@ -916,6 +916,41 @@ class Rbd(Image):
             self.driver.remove_image(name)
         self.driver.import_image(local_file, name)
 
+    def create_from_func(self, context, func, cache_name, size, fallback=None):
+        cache_path = self._get_cached_output_path(func, cache_name, fallback)
+        with self.remove_volume_on_error():
+            self.driver.import_image(cache_path, self.rbd_name)
+
+    def create_from_image(self, context, image_id, size, fallback=None):
+        if self._clone_from_glance_location(context, image_id, size):
+            return
+        image_info = self._get_cached_image(context, image_id, size, fallback)
+        with self.remove_volume_on_error():
+            self.driver.import_image(image_info.path, self.rbd_name)
+            self._resize_disk(size, image_info.virtual_size)
+
+    def _clone_from_glance_location(self, context, image_id, size):
+        image_meta = IMAGE_API.get(context, image_id, include_locations=True)
+        locations = image_meta['locations']
+        for location in locations:
+            if self.driver.is_cloneable(location, image_meta):
+                with self.remove_volume_on_error():
+                    self.driver.clone(location, self.rbd_name)
+                    # TODO(mdbooth): It would be better to verify
+                    # base size before cloning the disk, but we'd
+                    # need some additional methods in rbd_utils.
+                    self.verify_base_size(self.rbd_name, size)
+                    return location
+
+    @contextlib.contextmanager
+    def remove_volume_on_error(self):
+        try:
+            yield
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                if self.exists():
+                    self.driver.remove_image(self.rbd_name)
+
     def create_snap(self, name):
         return self.driver.create_snap(self.rbd_name, name)
 

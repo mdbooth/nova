@@ -236,6 +236,10 @@ class Image(object):
         if size and size > virtual_size:
             self.resize_image(size)
 
+    def _preallocate_disk(self, size):
+        if self.preallocate and self._can_fallocate():
+            utils.execute('fallocate', '-n', '-l', size, self.path)
+
     def _can_fallocate(self):
         """Check once per class, whether fallocate(1) is available,
            and that the instances directory supports fallocate(2).
@@ -523,6 +527,24 @@ class Flat(Image):
                     copy_raw_image(base, self.path, size)
 
         self.correct_format()
+
+    def create_from_func(self, context, func, cache_name, size, fallback=None):
+        cache_path = self._get_cached_output_path(func, cache_name, fallback)
+        with self._create(size) as target:
+            libvirt_utils.copy_image(cache_path, target)
+
+    def create_from_image(self, context, image_id, size, fallback=None):
+        image_info = self._get_cached_image(context, image_id, size, fallback)
+        with self._create(size) as target:
+            libvirt_utils.copy_image(image_info.path, target)
+            self._resize_disk(size, image_info.virtual_size)
+
+    @contextlib.contextmanager
+    def _create(self, size):
+        with fileutils.remove_path_on_error(self.path):
+            yield self.path  # /instances/instance-uuid/some-disk
+            self._preallocate_disk(size)
+            self.correct_format()
 
     def resize_image(self, size):
         image = imgmodel.LocalFileImage(self.path, self.driver_format)

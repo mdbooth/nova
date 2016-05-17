@@ -102,6 +102,8 @@ class _ImageTestCase(object):
 
         fake_processutils.fake_execute_clear_log()
         fake_processutils.stub_out_processutils_execute(self.stubs)
+
+        self.image_class.can_fallocate = None
         image = self.image_class(self.INSTANCE, self.NAME)
 
         def fake_fetch(target, *args, **kwargs):
@@ -230,6 +232,62 @@ class FlatTestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.StubOutWithMock(imagebackend.libvirt_utils, 'copy_image')
         self.mox.StubOutWithMock(imagebackend.disk, 'extend')
         return fn
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_create_from_func(self, mock_cache, mock_copy):
+        CONF.set_override('preallocate_images', 'space')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = mock.sentinel.path
+        size = mock.sentinel.size
+        with self._create_mocks(image, size, should_resize=False):
+            image.create_from_func(
+                self.CONTEXT, mock.sentinel.func, mock.sentinel.cache_name,
+                size, mock.sentinel.fallback)
+            mock_copy.assert_called_once_with(mock.sentinel.path, self.PATH)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_success(self, mock_cache, mock_copy):
+        CONF.set_override('preallocate_images', 'space')
+        image, size = self._flavor_disk_larger_than_image(
+            mock_cache, mock.sentinel.path)
+        with self._create_mocks(image, size, should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_copy.assert_called_once_with(mock.sentinel.path, self.PATH)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_error(self, mock_cache, mock_copy):
+        CONF.set_override('preallocate_images', 'space')
+        image, size = self._flavor_disk_smaller_than_image(
+            mock_cache, mock.sentinel.path)
+        self.assertRaises(
+            exception.FlavorDiskSmallerThanImage, image.create_from_image,
+            self.CONTEXT, mock.sentinel.image_id, size)
+        self.assertEqual(0, mock_copy.call_count)
+
+    @contextlib.contextmanager
+    def _create_mocks(self, image, size, should_resize):
+        self.image_class.can_fallocate = None
+        fallocate_calls = [
+            'fallocate -l 1 %s.fallocate_test' % self.PATH,
+            'fallocate -n -l %s %s' % (size, self.PATH),
+        ]
+        with test.nested(
+            mock.patch('nova.virt.disk.api.extend'),
+            mock.patch.object(image, 'correct_format'),
+        ) as (mock_resize, mock_correct):
+            fake_processutils.fake_execute_clear_log()
+            fake_processutils.stub_out_processutils_execute(self.stubs)
+            yield
+            if should_resize:
+                self.assertEqual(1, mock_resize.call_count)
+            else:
+                self.assertEqual(0, mock_resize.call_count)
+            self.assertEqual(
+                fallocate_calls, fake_processutils.fake_execute_get_log())
+            self.assertEqual(1, mock_correct.call_count)
 
     def test_cache(self):
         self.mox.StubOutWithMock(os.path, 'exists')

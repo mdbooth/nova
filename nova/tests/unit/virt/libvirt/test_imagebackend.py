@@ -14,6 +14,7 @@
 #    under the License.
 
 import base64
+import contextlib
 import inspect
 import os
 import shutil
@@ -39,6 +40,7 @@ from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import imagebackend
+from nova.virt.libvirt import imagecache
 from nova.virt.libvirt.storage import rbd_utils
 
 CONF = nova.conf.CONF
@@ -191,6 +193,24 @@ class _ImageTestCase(object):
         image = self.image_class(self.INSTANCE, self.NAME)
         self.assertEqual(2361393152, image.get_disk_size(image.path))
         get_disk_size.assert_called_once_with(image.path)
+
+    def _flavor_disk_larger_than_image(self, mock_cache, path,
+                                       file_format=None, disk_size=None):
+        # flavor root disk size (100) > virtual disk size (99)
+        size, virtual_size = 100, 99
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = imagecache.CachedImageInfo(
+            path, file_format, virtual_size, disk_size)
+        return image, size
+
+    def _flavor_disk_smaller_than_image(self, mock_cache, path,
+                                        file_format=None, disk_size=None):
+        # flavor root disk size (99) < virtual disk size (100)
+        size, virtual_size = 99, 100
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = imagecache.CachedImageInfo(
+            path, file_format, virtual_size, disk_size)
+        return image, size
 
 
 class FlatTestCase(_ImageTestCase, test.NoDBTestCase):
@@ -1582,6 +1602,82 @@ class PloopTestCase(_ImageTestCase, test.NoDBTestCase):
         super(PloopTestCase, self).setUp()
         self.utils = imagebackend.utils
 
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_create_from_func(self, mock_cache, mock_copy):
+        target = os.path.join(self.PATH, 'root.hds')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = mock.sentinel.path
+        with self._create_mocks(should_resize=False):
+            image.create_from_func(
+                self.CONTEXT, mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.size, mock.sentinel.fallback)
+            mock_copy.assert_called_once_with(mock.sentinel.path, target)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_success(self, mock_cache, mock_copy):
+        target = os.path.join(self.PATH, 'root.hds')
+        image, size = self._flavor_disk_larger_than_image(
+            mock_cache, mock.sentinel.path)
+        with self._create_mocks(should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_copy.assert_called_once_with(mock.sentinel.path, target)
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_error(self, mock_cache, mock_copy):
+        image, size = self._flavor_disk_smaller_than_image(
+            mock_cache, mock.sentinel.path)
+        self.assertRaises(
+            exception.FlavorDiskSmallerThanImage, image.create_from_image,
+            self.CONTEXT, mock.sentinel.image_id, size)
+        self.assertEqual(0, mock_copy.call_count)
+
+    @mock.patch.object(imagebackend.IMAGE_API, 'get')
+    def test_create_from_image_format_raw(self, mock_get):
+        CONF.set_override('force_raw_images', False)
+        mock_get.return_value = {'disk_format': 'raw'}
+        self._test_create_from_image_format_success()
+
+    @mock.patch.object(imagebackend.IMAGE_API, 'get')
+    def test_create_from_image_format_ploop(self, mock_get):
+        CONF.set_override('force_raw_images', False)
+        mock_get.return_value = {'disk_format': 'ploop'}
+        self._test_create_from_image_format_success()
+
+    @mock.patch.object(fake_libvirt_utils, 'copy_image')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def _test_create_from_image_format_success(self, mock_cache, mock_copy):
+        target = os.path.join(self.PATH, 'root.hds')
+        image, size = self._flavor_disk_larger_than_image(
+            mock_cache, mock.sentinel.path)
+        with self._create_mocks(should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_copy.assert_called_once_with(mock.sentinel.path, target)
+
+    @mock.patch.object(imagebackend.IMAGE_API, 'get')
+    def test_create_from_image_format_error(self, mock_get):
+        CONF.set_override('force_raw_images', False)
+        mock_get.return_value = {'disk_format': mock.sentinel.bad_format}
+        image = self.image_class(self.INSTANCE, self.NAME)
+        self.assertRaises(
+            exception.ImageUnacceptable, image.create_from_image, self.CONTEXT,
+            mock.sentinel.image_id, mock.sentinel.size)
+
+    @contextlib.contextmanager
+    def _create_mocks(self, should_resize):
+        with test.nested(
+            mock.patch.object(imagebackend.Ploop, 'resize_image'),
+            mock.patch.object(imagebackend.Ploop, '_restore_descriptor')
+        ) as (mock_resize, mock_restore):
+            yield
+            self.assertEqual(1, mock_restore.call_count)
+            if should_resize:
+                self.assertEqual(1, mock_resize.call_count)
+            else:
+                self.assertEqual(0, mock_resize.call_count)
+
     def prepare_mocks(self):
         fn = self.mox.CreateMockAnything()
         self.mox.StubOutWithMock(imagebackend.utils.synchronized,
@@ -1612,7 +1708,8 @@ class PloopTestCase(_ImageTestCase, test.NoDBTestCase):
     def test_create_image(self):
         self.stubs.Set(imagebackend.Ploop, 'get_disk_size', lambda a, b: 2048)
         fn = self.prepare_mocks()
-        fn(target=self.TEMPLATE_PATH, max_size=2048, image_id=None)
+        fn(target=self.TEMPLATE_PATH, max_size=2048, image_id=None,
+           context=None)
         img_path = os.path.join(self.PATH, "root.hds")
         imagebackend.libvirt_utils.copy_image(self.TEMPLATE_PATH, img_path)
         self.utils.execute("ploop", "restore-descriptor", "-f", "raw",
@@ -1623,7 +1720,8 @@ class PloopTestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.ReplayAll()
 
         image = self.image_class(self.INSTANCE, self.NAME)
-        image.create_image(fn, self.TEMPLATE_PATH, 2048, image_id=None)
+        image.create_image(fn, self.TEMPLATE_PATH, 2048, image_id=None,
+                           context=None)
 
         self.mox.VerifyAll()
 

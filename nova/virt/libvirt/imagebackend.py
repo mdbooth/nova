@@ -39,6 +39,7 @@ from nova.virt.disk import api as disk
 from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import imagecache
 from nova.virt.libvirt.storage import dmcrypt
 from nova.virt.libvirt.storage import lvm
 from nova.virt.libvirt.storage import rbd_utils
@@ -219,6 +220,21 @@ class Image(object):
             if (self.preallocate and self._can_fallocate() and
                     os.access(self.path, os.W_OK)):
                 utils.execute('fallocate', '-n', '-l', size, self.path)
+
+    def _get_cached_output_path(self, func, cache_name, fallback):
+        cache = imagecache.ImageCacheLocalDir.get()
+        cache_path = cache.get_func_output_path(func, cache_name, fallback)
+        return cache_path
+
+    def _get_cached_image(self, context, image_id, size, fallback):
+        cache = imagecache.ImageCacheLocalDir.get()
+        image_info = cache.get_image_info(context, image_id, fallback)
+        self.verify_base_size(None, size, image_info.virtual_size)
+        return image_info
+
+    def _resize_disk(self, size, virtual_size):
+        if size and size > virtual_size:
+            self.resize_image(size)
 
     def _can_fallocate(self):
         """Check once per class, whether fallocate(1) is available,
@@ -1016,32 +1032,13 @@ class Ploop(Image):
         def create_ploop_image(base, target, size):
             image_path = os.path.join(target, "root.hds")
             libvirt_utils.copy_image(base, image_path)
-            utils.execute('ploop', 'restore-descriptor', '-f', self.pcs_format,
-                          target, image_path)
+            self._restore_descriptor(self.path, self.pcs_format, image_path)
             if size:
-                dd_path = os.path.join(self.path, "DiskDescriptor.xml")
-                utils.execute('ploop', 'grow', '-s', '%dK' % (size >> 10),
-                              dd_path, run_as_root=True)
+                self.resize_image(size)
 
         if not os.path.exists(self.path):
-            if CONF.force_raw_images:
-                self.pcs_format = "raw"
-            else:
-                image_meta = IMAGE_API.get(kwargs["context"],
-                                           kwargs["image_id"])
-                format = image_meta.get("disk_format")
-                if format == "ploop":
-                    self.pcs_format = "expanded"
-                elif format == "raw":
-                    self.pcs_format = "raw"
-                else:
-                    reason = _("PCS doesn't support images in %s format."
-                                " You should either set force_raw_images=True"
-                                " in config or upload an image in ploop"
-                                " or raw format.") % format
-                    raise exception.ImageUnacceptable(
-                                        image_id=kwargs["image_id"],
-                                        reason=reason)
+            self.pcs_format = self._verify_pcs_format(
+                kwargs["context"], kwargs["image_id"])
 
         if not os.path.exists(base):
             prepare_template(target=base, max_size=size, *args, **kwargs)
@@ -1061,6 +1058,50 @@ class Ploop(Image):
         dd_path = os.path.join(self.path, "DiskDescriptor.xml")
         utils.execute('ploop', 'grow', '-s', '%dK' % (size >> 10), dd_path,
                       run_as_root=True)
+
+    def _restore_descriptor(self, path, pcs_format, image_path):
+        utils.execute('ploop', 'restore-descriptor', '-f', pcs_format,
+                      path, image_path)
+
+    def create_from_func(self, context, func, cache_name, size, fallback=None):
+        cache_path = self._get_cached_output_path(func, cache_name, fallback)
+        with self._create(pcs_format='raw') as target:
+            libvirt_utils.copy_image(cache_path, target)
+
+    def create_from_image(self, context, image_id, size, fallback=None):
+        pcs_format = self._verify_pcs_format(context, image_id)
+        image_info = self._get_cached_image(context, image_id, size, fallback)
+        with self._create(pcs_format) as target:
+            libvirt_utils.copy_image(image_info.path, target)
+            self._resize_disk(size, image_info.virtual_size)
+
+    @contextlib.contextmanager
+    def _create(self, pcs_format):
+        target = os.path.join(self.path, 'root.hds')
+        remove_func = functools.partial(
+            fileutils.delete_if_exists, remove=shutil.rmtree)
+        with fileutils.remove_path_on_error(self.path, remove=remove_func):
+            fileutils.ensure_tree(self.path)
+            yield target  # /instances/instance-uuid/some-disk/root.hds
+            self._restore_descriptor(self.path, pcs_format, target)
+
+    def _verify_pcs_format(self, context, image_id):
+        if CONF.force_raw_images:
+            pcs_format = 'raw'
+        else:
+            image_meta = IMAGE_API.get(context, image_id)
+            disk_format = image_meta.get('disk_format')
+            if disk_format == 'ploop':
+                pcs_format = 'expanded'
+            elif disk_format == 'raw':
+                pcs_format = 'raw'
+            else:
+                reason = _("PCS doesn't support images in %s format. You "
+                    "should either set force_raw_images=True in config or "
+                    "upload an image in ploop or raw format.") % disk_format
+                raise exception.ImageUnacceptable(
+                    image_id=image_id, reason=reason)
+        return pcs_format
 
     def snapshot_extract(self, target, out_format):
         img_path = os.path.join(self.path, "root.hds")

@@ -115,6 +115,36 @@ class Image(object):
         pass
 
     @abc.abstractmethod
+    def create_from_func(self, context, func, cache_name, size, fallback=None):
+        """Create a disk from the output of a function. Used to create
+        ephemeral and swap disks.
+
+        :context: The current request context.
+        :func: A function, taking a path argument, which will write data
+               to the given path.
+        :cache_name: A name which can be used as a cache key for the output
+                     of the given function.
+        :size: The size of the disk to create, in bytes.
+        :fallback: A compute host to side-load the output from if it is not
+                   already in the image cache.
+
+        """
+        pass
+
+    @abc.abstractmethod
+    def create_from_image(self, context, image_id, size, fallback=None):
+        """Create a disk from a glance image.
+
+        :context: The current request context.
+        :image_id: The image_id of the image to be fetched.
+        :size: The size of the disk to create, in bytes.
+        :fallback: A compute host to side-load the image from if it is no
+                   longer in the image cache or in glance.
+
+        """
+        pass
+
+    @abc.abstractmethod
     def resize_image(self, size):
         """Resize image to size (in bytes).
 

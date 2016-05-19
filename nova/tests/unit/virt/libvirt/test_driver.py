@@ -9363,6 +9363,14 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                     gotFiles.append({'filename': filename,
                                      'size': size})
 
+                def create_from_func(self, context, func, name, size,
+                                     fallback=None):
+                    pass
+
+                def create_from_image(self, context, image_id, size,
+                                      fallback=None):
+                    pass
+
                 def snapshot(self, name):
                     pass
 
@@ -9466,6 +9474,14 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                         outer.assertEqual(fetch_func,
                                 fake_libvirt_utils.fetch_raw_image)
 
+                def create_from_func(self, context, func, cache_name, size,
+                                     fallback=None):
+                    pass
+
+                def create_from_image(self, context, image_id, size,
+                                      fallback=None):
+                    pass
+
                 def resize_image(self, size):
                     pass
 
@@ -9534,6 +9550,14 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def import_file(self, instance, local_filename,
                                 remote_filename):
                     imported_files.append((local_filename, remote_filename))
+
+                def create_from_func(self, context, func, cache_name, size,
+                                     fallback=None):
+                    pass
+
+                def create_from_image(self, context, image_id, size,
+                                      fallback=None):
+                    pass
 
                 def snapshot(self, name):
                     pass

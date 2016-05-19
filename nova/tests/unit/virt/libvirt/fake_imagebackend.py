@@ -38,6 +38,14 @@ class Backend(object):
             def cache(self, fetch_func, filename, size=None, *args, **kwargs):
                 pass
 
+            def create_from_func(self, context, func, name, size,
+                                 fallbackhost=None):
+                pass
+
+            def create_from_image(self, context, image_id, size,
+                                  fallback=None):
+                pass
+
             def snapshot(self, name):
                 pass
 

@@ -751,16 +751,7 @@ class Lvm(Image):
         generated = 'ephemeral_size' in kwargs
         if self.ephemeral_key_uuid is not None:
             if 'context' in kwargs:
-                try:
-                    # NOTE(dgenin): Key manager corresponding to the
-                    # specific backend catches and reraises an
-                    # an exception if key retrieval fails.
-                    key = self.key_manager.get(kwargs['context'],
-                            self.ephemeral_key_uuid).get_encoded()
-                except Exception:
-                    with excutils.save_and_reraise_exception():
-                        LOG.error(_LE("Failed to retrieve ephemeral encryption"
-                                      " key"))
+                key = self._get_encryption_key(['context'])
             else:
                 raise exception.NovaException(
                     _("Instance disk to be encrypted but no context provided"))
@@ -778,10 +769,46 @@ class Lvm(Image):
             with self.remove_volume_on_error(self.path):
                 create_lvm_image(base, size)
 
-    # NOTE(nic): Resizing the image is already handled in create_image(),
-    # and migrate/resize is not supported with LVM yet, so this is a no-op
+    def create_from_func(self, context, func, cache_name, size, fallback=None):
+        cache_path = self._get_cached_output_path(func, cache_name, fallback)
+        with self._create(context, size) as target:
+            images.convert_image_unsafe(
+                cache_path, target, self.driver_format, run_as_root=True)
+
+    def create_from_image(self, context, image_id, size, fallback=None):
+        image_info = self._get_cached_image(context, image_id, size, fallback)
+        with self._create(context, size) as target:
+            images.convert_image(
+                image_info.path, target, image_info.file_format,
+                self.driver_format, run_as_root=True)
+            self._resize_disk(size, image_info.virtual_size)
+
+    @contextlib.contextmanager
+    def _create(self, context, size):
+        with self.remove_volume_on_error(self.path):
+            lvm.create_volume(self.vg, self.lv, size, sparse=self.sparse)
+            if self.ephemeral_key_uuid is not None:
+                self._encrypt_lvm_image(context)
+            yield self.path  # /dev/some-volume-group/instance-uuid_some-disk
+
+    def _get_encryption_key(self, context):
+        try:
+            return self.key_manager.get(
+                context, self.ephemeral_key_uuid).get_encoded()
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE("Failed to retrieve ephemeral encryption key"))
+
+    def _encrypt_lvm_image(self, context):
+        key = self._get_encryption_key(context)
+        target = self.path.rpartition('/')[2]  # instance-uuid_some-disk
+        dmcrypt.create_volume(
+            target, self.lv_path, CONF.ephemeral_storage_encryption.cipher,
+            CONF.ephemeral_storage_encryption.key_size, key)
+
     def resize_image(self, size):
-        pass
+        # size is ignored here, already taken into account by lvm.create_volume
+        disk.resize2fs(self.path, run_as_root=True)
 
     @contextlib.contextmanager
     def remove_volume_on_error(self, path):

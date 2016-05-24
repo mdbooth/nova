@@ -723,6 +723,59 @@ class LvmTestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.StubOutWithMock(self.utils, 'execute')
         return fn
 
+    @mock.patch.object(images, 'convert_image_unsafe')
+    @mock.patch.object(imagebackend.lvm, 'create_volume')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_create_from_func(self, mock_cache, mock_create, mock_convert):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = mock.sentinel.path
+        with self._create_mocks(should_resize=False):
+            image.create_from_func(
+                self.CONTEXT, mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.size, mock.sentinel.fallback)
+            mock_create.assert_called_once_with(
+                self.VG, self.LV, mock.sentinel.size, sparse=False)
+            mock_convert.assert_called_once_with(
+                mock.sentinel.path, self.PATH, 'raw', run_as_root=True)
+
+    @mock.patch.object(images, 'convert_image')
+    @mock.patch.object(imagebackend.lvm, 'create_volume')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_success(self, mock_cache, mock_create,
+                                       mock_convert):
+        image, size = self._flavor_disk_larger_than_image(
+            mock_cache, mock.sentinel.path, mock.sentinel.file_format)
+        with self._create_mocks(should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_create.assert_called_once_with(
+                self.VG, self.LV, size, sparse=False)
+            mock_convert.assert_called_once_with(
+                mock.sentinel.path, self.PATH, mock.sentinel.file_format,
+                'raw', run_as_root=True)
+
+    @mock.patch.object(imagebackend.lvm, 'create_volume')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_error(self, mock_cache, mock_create):
+        image, size = self._flavor_disk_smaller_than_image(
+            mock_cache, mock.sentinel.path, mock.sentinel.file_format)
+        self.assertRaises(
+            exception.FlavorDiskSmallerThanImage, image.create_from_image,
+            self.CONTEXT, mock.sentinel.image_id, size)
+        self.assertEqual(0, mock_create.call_count)
+
+    @contextlib.contextmanager
+    def _create_mocks(self, should_resize):
+        with test.nested(
+            mock.patch('nova.virt.disk.api.resize2fs'),
+            mock.patch.object(imagebackend.dmcrypt, 'create_volume')
+        ) as (mock_resize, mock_dmcrypt_create):
+            yield
+            if should_resize:
+                self.assertEqual(1, mock_resize.call_count)
+            else:
+                self.assertEqual(0, mock_resize.call_count)
+            self.assertEqual(0, mock_dmcrypt_create.call_count)
+
     def _create_image(self, sparse):
         fn = self.prepare_mocks()
         fn(max_size=None, target=self.TEMPLATE_PATH)
@@ -936,6 +989,77 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
         self.utils = imagebackend.utils
         self.libvirt_utils = imagebackend.libvirt_utils
         self.dmcrypt = imagebackend.dmcrypt
+
+    @mock.patch.object(imagebackend.lvm, 'remove_volumes')
+    @mock.patch.object(imagebackend.lvm, 'create_volume')
+    @mock.patch.object(imagebackend.dmcrypt, 'delete_volume')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_get_encryption_key_error(self, mock_cache, mock_delete,
+                                      mock_create, mock_remove):
+        self.INSTANCE['ephemeral_key_uuid'] = 'bad key'
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = mock.sentinel.path
+        self.assertRaises(
+            KeyError, image.create_from_func, self.CONTEXT,
+            mock.sentinel.func, mock.sentinel.cache_name, mock.sentinel.size)
+        mock_remove.assert_called_once_with([self.LV_PATH])
+        mock_delete.assert_called_once_with(self.PATH.rpartition('/')[2])
+
+    @mock.patch.object(images, 'convert_image_unsafe')
+    @mock.patch.object(imagebackend.lvm, 'create_volume')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_create_from_func(self, mock_cache, mock_create, mock_convert):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_cache.return_value = mock.sentinel.path
+        with self._create_mocks(should_resize=False):
+            image.create_from_func(
+                self.CONTEXT, mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.size, mock.sentinel.fallback)
+            mock_create.assert_called_once_with(
+                self.VG, self.LV, mock.sentinel.size, sparse=False)
+            mock_convert.assert_called_once_with(
+                mock.sentinel.path, self.PATH, 'raw', run_as_root=True)
+
+    @mock.patch.object(images, 'convert_image')
+    @mock.patch.object(imagebackend.lvm, 'create_volume')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_success(self, mock_cache, mock_create,
+                                       mock_convert):
+        image, size = self._flavor_disk_larger_than_image(
+            mock_cache, mock.sentinel.path, mock.sentinel.file_format)
+        with self._create_mocks(should_resize=True):
+            image.create_from_image(self.CONTEXT, mock.sentinel.image_id, size)
+            mock_create.assert_called_once_with(
+                self.VG, self.LV, size, sparse=False)
+            mock_convert.assert_called_once_with(
+                mock.sentinel.path, self.PATH, mock.sentinel.file_format,
+                'raw', run_as_root=True)
+
+    @mock.patch.object(imagebackend.lvm, 'create_volume')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_create_from_image_error(self, mock_cache, mock_create):
+        image, size = self._flavor_disk_smaller_than_image(
+            mock_cache, mock.sentinel.path, mock.sentinel.file_format)
+        self.assertRaises(
+            exception.FlavorDiskSmallerThanImage, image.create_from_image,
+            self.CONTEXT, mock.sentinel.image_id, size)
+        self.assertEqual(0, mock_create.call_count)
+
+    @contextlib.contextmanager
+    def _create_mocks(self, should_resize):
+        with test.nested(
+            mock.patch('nova.virt.disk.api.resize2fs'),
+            mock.patch.object(imagebackend.dmcrypt, 'create_volume')
+        ) as (mock_resize, mock_dmcrypt_create):
+            yield
+            if should_resize:
+                self.assertEqual(1, mock_resize.call_count)
+            else:
+                self.assertEqual(0, mock_resize.call_count)
+            mock_dmcrypt_create.assert_called_once_with(
+                self.PATH.rpartition('/')[2], self.LV_PATH,
+                CONF.ephemeral_storage_encryption.cipher,
+                CONF.ephemeral_storage_encryption.key_size, self.KEY)
 
     def _create_image(self, sparse):
         with test.nested(

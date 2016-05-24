@@ -629,6 +629,23 @@ class Qcow2(Image):
             with fileutils.remove_path_on_error(self.path):
                 copy_qcow2_image(base, self.path, size)
 
+    def create_from_func(self, context, func, cache_name, size, fallback=None):
+        cache_path = self._get_cached_output_path(func, cache_name, fallback)
+        with self._create(size) as target:
+            libvirt_utils.create_cow_image(cache_path, target)
+
+    def create_from_image(self, context, image_id, size, fallback=None):
+        image_info = self._get_cached_image(context, image_id, size, fallback)
+        with self._create(size) as target:
+            libvirt_utils.create_cow_image(image_info.path, target)
+            self._resize_disk(size, image_info.virtual_size)
+
+    @contextlib.contextmanager
+    def _create(self, size):
+        with fileutils.remove_path_on_error(self.path):
+            yield self.path  # /instances/instance-uuid/some-disk
+            self._preallocate_disk(size)
+
     def resize_image(self, size):
         image = imgmodel.LocalFileImage(self.path, imgmodel.FORMAT_QCOW2)
         disk.extend(image, size)

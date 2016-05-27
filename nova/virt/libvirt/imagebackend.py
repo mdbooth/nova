@@ -106,6 +106,14 @@ class Image(object):
         """
         pass
 
+    def check_backing_from_func(self, func, cache_name, fallback=None):
+        """Creates missing backing file from func (if applicable)."""
+        pass
+
+    def check_backing_from_image(self, context, image_id, fallback=None):
+        """Creates missing backing file from glance image (if applicable)."""
+        pass
+
     @abc.abstractmethod
     def resize_image(self, size):
         """Resize image to size (in bytes).
@@ -628,6 +636,25 @@ class Qcow2(Image):
         if not os.path.exists(self.path):
             with fileutils.remove_path_on_error(self.path):
                 copy_qcow2_image(base, self.path, size)
+
+    def check_backing_from_func(self, func, cache_name, fallback=None):
+        cache = imagecache.ImageCacheLocalDir.get()
+        missing_backing_file = self._check_backing_file()
+        if missing_backing_file:
+            cache.get_func_output_path(func, cache_name, fallback)
+
+    def check_backing_from_image(self, context, image_id, fallback=None):
+        cache = imagecache.ImageCacheLocalDir.get()
+        missing_backing_file = self._check_backing_file()
+        if missing_backing_file:
+            cache.get_image_info(context, image_id, fallback)
+
+    def _check_backing_file(self):
+        backing_path = libvirt_utils.get_disk_backing_file(
+            self.path, imgmodel.FORMAT_QCOW2)
+        if backing_path is None or os.path.exists(backing_path):
+            return  # doesn't use a backing file or it is already cached
+        return backing_path
 
     def create_from_func(self, context, func, cache_name, size, fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)

@@ -445,6 +445,74 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.StubOutWithMock(imagebackend.disk, 'extend')
         return fn
 
+    @mock.patch.object(fake_libvirt_utils, 'get_disk_backing_file')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_check_backing_from_func_backless(self, mock_cache, mock_backing):
+        mock_backing.return_value = None
+        image = self.image_class(self.INSTANCE, self.NAME)
+        image.check_backing_from_func(
+            mock.sentinel.func, mock.sentinel.cache_name,
+            mock.sentinel.fallback)
+        self.assertEqual(0, mock_cache.call_count)
+
+    @mock.patch.object(fake_libvirt_utils, 'get_disk_backing_file')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_check_backing_from_func_exists(self, mock_cache, mock_backing):
+        mock_backing.return_value = mock.sentinel.backing_file_path
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch('os.path.exists') as mock_exists:
+            mock_exists.return_value = True
+            image.check_backing_from_func(
+                mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.fallback)
+        self.assertEqual(0, mock_cache.call_count)
+
+    @mock.patch.object(fake_libvirt_utils, 'get_disk_backing_file')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
+    def test_check_backing_from_func_missing(self, mock_cache, mock_backing):
+        mock_backing.return_value = mock.sentinel.backing_file_path
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch('os.path.exists') as mock_exists:
+            mock_exists.return_value = False
+            image.check_backing_from_func(
+                mock.sentinel.func, mock.sentinel.cache_name,
+                mock.sentinel.fallback)
+        mock_cache.assert_called_once_with(
+            mock.sentinel.func, mock.sentinel.cache_name,
+            mock.sentinel.fallback)
+
+    @mock.patch.object(fake_libvirt_utils, 'get_disk_backing_file')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_check_backing_from_image_backless(self, mock_cache, mock_backing):
+        mock_backing.return_value = None
+        image = self.image_class(self.INSTANCE, self.NAME)
+        image.check_backing_from_image(
+            self.CONTEXT, mock.sentinel.image_id, mock.sentinel.fallback)
+        self.assertEqual(0, mock_cache.call_count)
+
+    @mock.patch.object(fake_libvirt_utils, 'get_disk_backing_file')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_check_backing_from_image_exists(self, mock_cache, mock_backing):
+        mock_backing.return_value = mock.sentinel.backing_file_path
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch('os.path.exists') as mock_exists:
+            mock_exists.return_value = True
+            image.check_backing_from_image(
+                self.CONTEXT, mock.sentinel.image_id, mock.sentinel.fallback)
+        self.assertEqual(0, mock_cache.call_count)
+
+    @mock.patch.object(fake_libvirt_utils, 'get_disk_backing_file')
+    @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_image_info')
+    def test_check_backing_from_image_missing(self, mock_cache, mock_backing):
+        mock_backing.return_value = mock.sentinel.backing_file_path
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch('os.path.exists') as mock_exists:
+            mock_exists.return_value = False
+            image.check_backing_from_image(
+                self.CONTEXT, mock.sentinel.image_id, mock.sentinel.fallback)
+        mock_cache.assert_called_once_with(
+            self.CONTEXT, mock.sentinel.image_id, mock.sentinel.fallback)
+
     @mock.patch.object(fake_libvirt_utils, 'create_cow_image')
     @mock.patch.object(imagecache.ImageCacheLocalDir, 'get_func_output_path')
     def test_create_from_func(self, mock_cache, mock_create):

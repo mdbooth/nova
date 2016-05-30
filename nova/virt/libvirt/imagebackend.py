@@ -25,7 +25,6 @@ from oslo_serialization import jsonutils
 from oslo_utils import excutils
 from oslo_utils import fileutils
 from oslo_utils import strutils
-from oslo_utils import units
 import six
 
 import nova.conf
@@ -92,19 +91,8 @@ class Image(object):
         """
         return False
 
-    @abc.abstractmethod
     def create_image(self, prepare_template, base, size, *args, **kwargs):
-        """Create image from template.
-
-        Contains specific behavior for each image type.
-
-        :prepare_template: function, that creates template.
-                           Should accept `target` argument.
-        :base: Template name
-        :size: Size of created image in bytes
-
-        """
-        pass
+        raise NotImplementedError()  # TODO(diana): delete method
 
     def check_backing_from_func(self, func, cache_name, fallback=None):
         """Creates missing backing file from func (if applicable)."""
@@ -223,41 +211,7 @@ class Image(object):
         return os.path.exists(self.path)
 
     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
-        """Creates image from template.
-
-        Ensures that template and image not already exists.
-        Ensures that base directory exists.
-        Synchronizes on template fetching.
-
-        :fetch_func: Function that creates the base image
-                     Should accept `target` argument.
-        :filename: Name of the file in the image directory
-        :size: Size of created image in bytes (optional)
-        """
-        @utils.synchronized(filename, external=True, lock_path=self.lock_path)
-        def fetch_func_sync(target, *args, **kwargs):
-            # The image may have been fetched while a subsequent
-            # call was waiting to obtain the lock.
-            if not os.path.exists(target):
-                fetch_func(target=target, *args, **kwargs)
-
-        base_dir = os.path.join(CONF.instances_path,
-                                CONF.image_cache_subdirectory_name)
-        if not os.path.exists(base_dir):
-            fileutils.ensure_tree(base_dir)
-        base = os.path.join(base_dir, filename)
-
-        if not self.exists() or not os.path.exists(base):
-            self.create_image(fetch_func_sync, base, size,
-                              *args, **kwargs)
-
-        if size:
-            if size > self.get_disk_size(base):
-                self.resize_image(size)
-
-            if (self.preallocate and self._can_fallocate() and
-                    os.access(self.path, os.W_OK)):
-                utils.execute('fallocate', '-n', '-l', size, self.path)
+        raise NotImplementedError()  # TODO(diana): delete method
 
     def _get_cached_output_path(self, func, cache_name, fallback):
         cache = imagecache.ImageCacheLocalDir.get()
@@ -401,19 +355,7 @@ class Image(object):
         return False
 
     def clone(self, context, image_id_or_uri):
-        """Clone an image.
-
-        Note that clone operation is backend-dependent. The backend may ask
-        the image API for a list of image "locations" and select one or more
-        of those locations to clone an image from.
-
-        :param image_id_or_uri: The ID or URI of an image to clone.
-
-        :raises: exception.ImageUnacceptable if it cannot be cloned
-        """
-        reason = _('clone() is not implemented')
-        raise exception.ImageUnacceptable(image_id=image_id_or_uri,
-                                          reason=reason)
+        raise NotImplementedError()  # TODO(diana): delete method
 
     def direct_snapshot(self, context, snapshot_name, image_format, image_id,
                         base_image_id):
@@ -433,10 +375,6 @@ class Image(object):
         This should be a no-op on any backend where it is not implemented.
         """
         pass
-
-    def _get_lock_name(self, base):
-        """Get an image's name of a base file."""
-        return os.path.split(base)[-1]
 
     def get_model(self, connection):
         """Get the image information model
@@ -536,36 +474,6 @@ class Flat(Image):
         if os.path.exists(self.path):
             self.driver_format = self.resolve_driver_format()
 
-    def create_image(self, prepare_template, base, size, *args, **kwargs):
-        filename = self._get_lock_name(base)
-
-        @utils.synchronized(filename, external=True, lock_path=self.lock_path)
-        def copy_raw_image(base, target, size):
-            libvirt_utils.copy_image(base, target)
-            if size:
-                image = imgmodel.LocalFileImage(target,
-                                                self.driver_format)
-                disk.extend(image, size)
-
-        generating = 'image_id' not in kwargs
-        if generating:
-            if not self.exists():
-                # Generating image in place
-                prepare_template(target=self.path, *args, **kwargs)
-        else:
-            if not os.path.exists(base):
-                prepare_template(target=base, max_size=size, *args, **kwargs)
-
-            # NOTE(mikal): Update the mtime of the base file so the image
-            # cache manager knows it is in use.
-            libvirt_utils.update_mtime(base)
-            self.verify_base_size(base, size)
-            if not os.path.exists(self.path):
-                with fileutils.remove_path_on_error(self.path):
-                    copy_raw_image(base, self.path, size)
-
-        self.correct_format()
-
     def create_from_func(self, context, func, cache_name, size, fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self._create(size) as target:
@@ -614,58 +522,6 @@ class Qcow2(Image):
         self.disk_info_path = os.path.join(os.path.dirname(self.path),
                                            'disk.info')
         self.resolve_driver_format()
-
-    def create_image(self, prepare_template, base, size, *args, **kwargs):
-        filename = self._get_lock_name(base)
-
-        @utils.synchronized(filename, external=True, lock_path=self.lock_path)
-        def copy_qcow2_image(base, target, size):
-            # TODO(pbrady): Consider copying the cow image here
-            # with preallocation=metadata set for performance reasons.
-            # This would be keyed on a 'preallocate_images' setting.
-            libvirt_utils.create_cow_image(base, target)
-            if size:
-                image = imgmodel.LocalFileImage(target, imgmodel.FORMAT_QCOW2)
-                disk.extend(image, size)
-
-        # Download the unmodified base image unless we already have a copy.
-        if not os.path.exists(base):
-            prepare_template(target=base, max_size=size, *args, **kwargs)
-
-        # NOTE(ankit): Update the mtime of the base file so the image
-        # cache manager knows it is in use.
-        libvirt_utils.update_mtime(base)
-        self.verify_base_size(base, size)
-
-        legacy_backing_size = None
-        legacy_base = base
-
-        # Determine whether an existing qcow2 disk uses a legacy backing by
-        # actually looking at the image itself and parsing the output of the
-        # backing file it expects to be using.
-        if os.path.exists(self.path):
-            backing_path = libvirt_utils.get_disk_backing_file(self.path)
-            if backing_path is not None:
-                backing_file = os.path.basename(backing_path)
-                backing_parts = backing_file.rpartition('_')
-                if backing_file != backing_parts[-1] and \
-                        backing_parts[-1].isdigit():
-                    legacy_backing_size = int(backing_parts[-1])
-                    legacy_base += '_%d' % legacy_backing_size
-                    legacy_backing_size *= units.Gi
-
-        # Create the legacy backing file if necessary.
-        if legacy_backing_size:
-            if not os.path.exists(legacy_base):
-                with fileutils.remove_path_on_error(legacy_base):
-                    libvirt_utils.copy_image(base, legacy_base)
-                    image = imgmodel.LocalFileImage(legacy_base,
-                                                    imgmodel.FORMAT_QCOW2)
-                    disk.extend(image, legacy_backing_size)
-
-        if not os.path.exists(self.path):
-            with fileutils.remove_path_on_error(self.path):
-                copy_qcow2_image(base, self.path, size)
 
     def check_backing_from_func(self, func, cache_name, fallback=None):
         cache = imagecache.ImageCacheLocalDir.get()
@@ -771,60 +627,6 @@ class Lvm(Image):
 
     def _can_fallocate(self):
         return False
-
-    def create_image(self, prepare_template, base, size, *args, **kwargs):
-        def encrypt_lvm_image():
-            dmcrypt.create_volume(self.path.rpartition('/')[2],
-                                  self.lv_path,
-                                  CONF.ephemeral_storage_encryption.cipher,
-                                  CONF.ephemeral_storage_encryption.key_size,
-                                  key)
-
-        filename = self._get_lock_name(base)
-
-        @utils.synchronized(filename, external=True, lock_path=self.lock_path)
-        def create_lvm_image(base, size):
-            base_size = disk.get_disk_size(base)
-            self.verify_base_size(base, size, base_size=base_size)
-            resize = size > base_size
-            size = size if resize else base_size
-            lvm.create_volume(self.vg, self.lv,
-                                         size, sparse=self.sparse)
-            if self.ephemeral_key_uuid is not None:
-                encrypt_lvm_image()
-            # NOTE: by calling convert_image_unsafe here we're
-            # telling qemu-img convert to do format detection on the input,
-            # because we don't know what the format is. For example,
-            # we might have downloaded a qcow2 image, or created an
-            # ephemeral filesystem locally, we just don't know here. Having
-            # audited this, all current sources have been sanity checked,
-            # either because they're locally generated, or because they have
-            # come from images.fetch_to_raw. However, this is major code smell.
-            images.convert_image_unsafe(base, self.path, self.driver_format,
-                                        run_as_root=True)
-            if resize:
-                disk.resize2fs(self.path, run_as_root=True)
-
-        generated = 'ephemeral_size' in kwargs
-        if self.ephemeral_key_uuid is not None:
-            if 'context' in kwargs:
-                key = self._get_encryption_key(['context'])
-            else:
-                raise exception.NovaException(
-                    _("Instance disk to be encrypted but no context provided"))
-        # Generate images with specified size right on volume
-        if generated and size:
-            lvm.create_volume(self.vg, self.lv,
-                                         size, sparse=self.sparse)
-            with self.remove_volume_on_error(self.path):
-                if self.ephemeral_key_uuid is not None:
-                    encrypt_lvm_image()
-                prepare_template(target=self.path, *args, **kwargs)
-        else:
-            if not os.path.exists(base):
-                prepare_template(target=base, max_size=size, *args, **kwargs)
-            with self.remove_volume_on_error(self.path):
-                create_lvm_image(base, size)
 
     def create_from_func(self, context, func, cache_name, size, fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
@@ -973,20 +775,6 @@ class Rbd(Image):
         """
         return self.driver.size(self.rbd_name)
 
-    def create_image(self, prepare_template, base, size, *args, **kwargs):
-
-        if not self.exists():
-            prepare_template(target=base, max_size=size, *args, **kwargs)
-
-        # prepare_template() may have cloned the image into a new rbd
-        # image already instead of downloading it locally
-        if not self.exists():
-            self.driver.import_image(base, self.rbd_name)
-        self.verify_base_size(base, size)
-
-        if size and size > self.get_disk_size(self.rbd_name):
-            self.driver.resize(self.rbd_name, size)
-
     def resize_image(self, size):
         self.driver.resize(self.rbd_name, size)
 
@@ -996,26 +784,6 @@ class Rbd(Image):
     @staticmethod
     def is_shared_block_storage():
         return True
-
-    def clone(self, context, image_id_or_uri):
-        image_meta = IMAGE_API.get(context, image_id_or_uri,
-                                   include_locations=True)
-        locations = image_meta['locations']
-
-        LOG.debug('Image locations are: %(locs)s' % {'locs': locations})
-
-        if image_meta.get('disk_format') not in ['raw', 'iso']:
-            reason = _('Image is not raw format')
-            raise exception.ImageUnacceptable(image_id=image_id_or_uri,
-                                              reason=reason)
-
-        for location in locations:
-            if self.driver.is_cloneable(location, image_meta):
-                return self.driver.clone(location, self.rbd_name)
-
-        reason = _('No image locations are accessible')
-        raise exception.ImageUnacceptable(image_id=image_id_or_uri,
-                                          reason=reason)
 
     def get_model(self, connection):
         secret = None
@@ -1182,35 +950,6 @@ class Ploop(Image):
                      os.path.join(libvirt_utils.get_instance_path(instance),
                                   disk_name))
         self.resolve_driver_format()
-
-    def create_image(self, prepare_template, base, size, *args, **kwargs):
-        filename = os.path.split(base)[-1]
-
-        @utils.synchronized(filename, external=True, lock_path=self.lock_path)
-        def create_ploop_image(base, target, size):
-            image_path = os.path.join(target, "root.hds")
-            libvirt_utils.copy_image(base, image_path)
-            self._restore_descriptor(self.path, self.pcs_format, image_path)
-            if size:
-                self.resize_image(size)
-
-        if not os.path.exists(self.path):
-            self.pcs_format = self._verify_pcs_format(
-                kwargs["context"], kwargs["image_id"])
-
-        if not os.path.exists(base):
-            prepare_template(target=base, max_size=size, *args, **kwargs)
-        self.verify_base_size(base, size)
-
-        if os.path.exists(self.path):
-            return
-
-        fileutils.ensure_tree(self.path)
-
-        remove_func = functools.partial(fileutils.delete_if_exists,
-                                        remove=shutil.rmtree)
-        with fileutils.remove_path_on_error(self.path, remove=remove_func):
-            create_ploop_image(base, self.path, size)
 
     def resize_image(self, size):
         dd_path = os.path.join(self.path, "DiskDescriptor.xml")

@@ -375,124 +375,6 @@ class FakeVirtDomain(object):
         return True
 
 
-class CacheConcurrencyTestCase(test.NoDBTestCase):
-    def setUp(self):
-        super(CacheConcurrencyTestCase, self).setUp()
-
-        self.flags(instances_path=self.useFixture(fixtures.TempDir()).path)
-
-        # utils.synchronized() will create the lock_path for us if it
-        # doesn't already exist. It will also delete it when it's done,
-        # which can cause race conditions with the multiple threads we
-        # use for tests. So, create the path here so utils.synchronized()
-        # won't delete it out from under one of the threads.
-        self.lock_path = os.path.join(CONF.instances_path, 'locks')
-        fileutils.ensure_tree(self.lock_path)
-
-        def fake_exists(fname):
-            basedir = os.path.join(CONF.instances_path,
-                                   CONF.image_cache_subdirectory_name)
-            if fname == basedir or fname == self.lock_path:
-                return True
-            return False
-
-        def fake_execute(*args, **kwargs):
-            pass
-
-        def fake_extend(image, size, use_cow=False):
-            pass
-
-        self.stub_out('os.path.exists', fake_exists)
-        self.stubs.Set(utils, 'execute', fake_execute)
-        self.stubs.Set(imagebackend.disk, 'extend', fake_extend)
-        self.useFixture(fixtures.MonkeyPatch(
-            'nova.virt.libvirt.imagebackend.libvirt_utils',
-            fake_libvirt_utils))
-
-    def _fake_instance(self, uuid):
-        return objects.Instance(id=1, uuid=uuid)
-
-    def test_same_fname_concurrency(self):
-        # Ensures that the same fname cache runs at a sequentially.
-        uuid = uuidutils.generate_uuid()
-
-        backend = imagebackend.Backend(False)
-        wait1 = eventlet.event.Event()
-        done1 = eventlet.event.Event()
-        sig1 = eventlet.event.Event()
-        thr1 = eventlet.spawn(backend.image(self._fake_instance(uuid),
-                                            'name').cache,
-                _concurrency, 'fname', None,
-                signal=sig1, wait=wait1, done=done1)
-        eventlet.sleep(0)
-        # Thread 1 should run before thread 2.
-        sig1.wait()
-
-        wait2 = eventlet.event.Event()
-        done2 = eventlet.event.Event()
-        sig2 = eventlet.event.Event()
-        thr2 = eventlet.spawn(backend.image(self._fake_instance(uuid),
-                                            'name').cache,
-                _concurrency, 'fname', None,
-                signal=sig2, wait=wait2, done=done2)
-
-        wait2.send()
-        eventlet.sleep(0)
-        try:
-            self.assertFalse(done2.ready())
-        finally:
-            wait1.send()
-        done1.wait()
-        eventlet.sleep(0)
-        self.assertTrue(done2.ready())
-        # Wait on greenthreads to assert they didn't raise exceptions
-        # during execution
-        thr1.wait()
-        thr2.wait()
-
-    def test_different_fname_concurrency(self):
-        # Ensures that two different fname caches are concurrent.
-        uuid = uuidutils.generate_uuid()
-
-        backend = imagebackend.Backend(False)
-        wait1 = eventlet.event.Event()
-        done1 = eventlet.event.Event()
-        sig1 = eventlet.event.Event()
-        thr1 = eventlet.spawn(backend.image(self._fake_instance(uuid),
-                                            'name').cache,
-                _concurrency, 'fname2', None,
-                signal=sig1, wait=wait1, done=done1)
-        eventlet.sleep(0)
-        # Thread 1 should run before thread 2.
-        sig1.wait()
-
-        wait2 = eventlet.event.Event()
-        done2 = eventlet.event.Event()
-        sig2 = eventlet.event.Event()
-        thr2 = eventlet.spawn(backend.image(self._fake_instance(uuid),
-                                            'name').cache,
-                _concurrency, 'fname1', None,
-                signal=sig2, wait=wait2, done=done2)
-        eventlet.sleep(0)
-        # Wait for thread 2 to start.
-        sig2.wait()
-
-        wait2.send()
-        tries = 0
-        while not done2.ready() and tries < 10:
-            eventlet.sleep(0)
-            tries += 1
-        try:
-            self.assertTrue(done2.ready())
-        finally:
-            wait1.send()
-            eventlet.sleep(0)
-        # Wait on greenthreads to assert they didn't raise exceptions
-        # during execution
-        thr1.wait()
-        thr2.wait()
-
-
 class FakeVolumeDriver(object):
     def __init__(self, *args, **kwargs):
         pass
@@ -9368,16 +9250,8 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                     self.path = os.path.join(instance['name'], name)
                     self.is_block_dev = is_block_dev
 
-                def create_image(self, prepare_template, base,
-                                 size, *args, **kwargs):
-                    pass
-
                 def resize_image(self, size):
                     pass
-
-                def cache(self, fetch_func, filename, size=None,
-                          *args, **kwargs):
-                    self.fail('Nothing should call cache()')
 
                 def create_from_func(self, context, func, name, size,
                                      fallback=None):
@@ -9469,14 +9343,6 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                     self.path = os.path.join(instance['name'], name)
                     self.is_block_dev = is_block_dev
 
-                def create_image(self, prepare_template, base,
-                                 size, *args, **kwargs):
-                    pass
-
-                def cache(self, fetch_func, filename, size=None,
-                          *args, **kwargs):
-                    self.fail('Nothing should call cache()')
-
                 def create_from_func(self, context, func, cache_name, size,
                                      fallback=None):
                     func_calls.append((self.path, cache_name, size))
@@ -9533,16 +9399,8 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                     self.path = os.path.join(instance['name'], name)
                     self.is_block_dev = is_block_dev
 
-                def create_image(self, prepare_template, base,
-                                 size, *args, **kwargs):
-                    pass
-
                 def resize_image(self, size):
                     pass
-
-                def cache(self, fetch_func, filename, size=None,
-                          *args, **kwargs):
-                    self.fail('Nothing should call cache()')
 
                 def create_from_func(self, context, func, cache_name, size,
                                      fallback=None):

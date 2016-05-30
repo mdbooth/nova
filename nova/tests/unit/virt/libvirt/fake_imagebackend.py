@@ -28,14 +28,7 @@ class Backend(object):
             def __init__(self, instance, name):
                 self.path = os.path.join(instance['name'], name)
 
-            def create_image(self, prepare_template, base,
-                              size, *args, **kwargs):
-                pass
-
             def resize_image(self, size):
-                pass
-
-            def cache(self, fetch_func, filename, size=None, *args, **kwargs):
                 pass
 
             def create_from_func(self, context, func, name, size,

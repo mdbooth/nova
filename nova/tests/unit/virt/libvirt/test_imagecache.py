@@ -14,7 +14,10 @@
 #    under the License.
 
 
+import collections
 import contextlib
+import eventlet
+import fixtures
 import os
 import six
 import time
@@ -1047,3 +1050,254 @@ class ImageCacheLocalDirTestCase(test.NoDBTestCase):
                                                 host=mock.sentinel.fallback,
                                                 receive=True)
         mock_create.assert_called_once_with(self.expected_func_path)
+
+
+class ImageCacheLocalDirConcurrencyTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(ImageCacheLocalDirConcurrencyTestCase, self).setUp()
+
+        self.tempdir = self.useFixture(fixtures.TempDir()).path
+        self.flags(instances_path=self.tempdir)
+
+        self.paths = set()
+        self.useFixture(fixtures.MonkeyPatch('os.path.exists',
+                                             self._fake_exists))
+
+        # update_mtime isn't relevant to these tests, and uses rootwrap
+        self.useFixture(fixtures.MonkeyPatch(
+            'nova.virt.libvirt.utils.update_mtime', mock.MagicMock()))
+
+        # Ensure we get a new singleton with each test run
+        imagecache.ImageCacheLocalDir._singleton = None
+        self.cache = imagecache.ImageCacheLocalDir.get()
+
+        self.threads = []
+        self.exited = []
+
+    def _thread_exit(self, thread):
+        self.exited.append(thread)
+
+    def _fake_exists(self, path):
+        return path in self.paths
+
+    def spawn(self, *args, **kwargs):
+        thread = eventlet.spawn(*args, **kwargs)
+        thread.link(self._thread_exit)
+        self.threads.append(thread)
+
+    def image_cache_path(self, image_id):
+        cache_name = imagecache.get_cache_fname(image_id)
+        return self.cache_path(cache_name)
+
+    def cache_path(self, name):
+        return os.path.join(self.tempdir, '_base', name)
+
+    def test_image_same(self):
+        # Test that fetching the same image multiple times concurrently only
+        # fetches it once, and that all callers wait until the fetch is
+        # complete
+        queue = eventlet.queue.Queue()
+        called = [False]
+
+        def fake_fetch_image(context, path, image_id):
+            # Fail fast without blocking if we're called twice
+            self.assertFalse(called[0])
+            called[0] = True
+
+            event = eventlet.event.Event()
+
+            # Let the main thread know we're done by pushing an event to the
+            # queue
+            queue.put(event)
+
+            # Wait for the main thread to tell us to proceed
+            event.wait()
+
+            # Ensure that a call to exists() now returns True for this path
+            self.paths.add(path)
+
+        with mock.patch.object(libvirt_utils, 'fetch_image',
+                side_effect=fake_fetch_image) as mock_fetch_image,\
+             mock.patch.object(nova.virt.images, 'qemu_img_info',
+                               autospec=True) as mock_qemu_img_info:
+            # Spawn 2 threads, both fetching the same image
+            image_id = uuidutils.generate_uuid()
+            for i in range(2):
+                self.spawn(self.cache.get_image_info,
+                           mock.sentinel.context, image_id)
+
+            # Wait for one of the above threads to call fetch_image
+            event = queue.get()
+
+            # Give both threads an opportunity to run
+            eventlet.sleep(0)
+
+            # Assert that neither thread has exited
+            self.assertEqual(0, len(self.exited))
+
+            # Allow the thread to continue
+            event.send()
+
+            # Wait for both threads to complete
+            for thread in self.threads:
+                thread.wait()
+
+            # The fact that we got here means nothing else called
+            # fetch_image, because it would have blocked
+            self.assertEqual(1, mock_fetch_image.call_count)
+
+            # Assert that we returned info from the same path twice
+            expected_call = mock.call(self.image_cache_path(image_id))
+            mock_qemu_img_info.assert_has_calls([expected_call] * 2)
+
+    def test_image_different(self):
+        # Test that fetching multiple images proceeds concurrently
+        queue = eventlet.queue.Queue()
+
+        def fake_fetch_image(context, path, image_id):
+            event = eventlet.event.Event()
+
+            # Let the main thread know we're done by pushing an event to the
+            # queue
+            queue.put(event)
+
+            # Wait for the main thread to tell us to proceed
+            event.wait()
+
+            # Ensure that a call to exists() now returns True for this path
+            self.paths.add(path)
+
+        with mock.patch.object(libvirt_utils, 'fetch_image',
+                               side_effect=fake_fetch_image) as mock_fetch_image, \
+                mock.patch.object(nova.virt.images, 'qemu_img_info',
+                                  autospec=True) as mock_qemu_img_info:
+
+            image_ids = [uuidutils.generate_uuid(), uuidutils.generate_uuid()]
+
+            # Spawn 2 threads, both fetching different images
+            for image_id in image_ids:
+                self.spawn(self.cache.get_image_info,
+                           mock.sentinel.context, image_id)
+
+            # Both threads should call fetch_image concurrently
+            event1 = queue.get()
+            event2 = queue.get()
+
+            # Assert that neither thread has exited
+            self.assertEqual(0, len(self.exited))
+
+            # Allow both threads to continue
+            event1.send()
+            event2.send()
+
+            # Wait for both threads to complete
+            for thread in self.threads:
+                thread.wait()
+
+            # Assert that we fetched both images
+            calls = map(
+                lambda image_id: mock.call(mock.sentinel.context,
+                                           self.image_cache_path(image_id),
+                                           image_id),
+                image_ids)
+            mock_fetch_image.assert_has_calls(calls, any_order=True)
+
+            # Assert that we returned info for both paths
+            calls = map(
+                lambda image_id: mock.call(self.image_cache_path(image_id)),
+                image_ids)
+            mock_qemu_img_info.assert_has_calls(calls, any_order=True)
+
+    def test_func_same(self):
+        # Test that fetching function output with the same name multiple
+        # times concurrently only executes it once, and that all callers
+        # wait until execution is complete
+        queue = eventlet.queue.Queue()
+        calls = []
+
+        def fake_func(path):
+            # Fail fast without blocking if we're called twice
+            self.assertEqual(0, len(calls))
+            calls.append(path)
+
+            event = eventlet.event.Event()
+
+            # Let the main thread know we're done by pushing an event to the
+            # queue
+            queue.put(event)
+
+            # Wait for the main thread to tell us to proceed
+            event.wait()
+
+            # Ensure that a call to exists() now returns True for this path
+            self.paths.add(path)
+
+        # Spawn 2 threads, both generating the same output
+        func_name = 'test'
+        for i in range(2):
+            self.spawn(self.cache.get_func_output_path, fake_func, func_name)
+
+        # Wait for one of the above threads to execute the function
+        event = queue.get()
+
+        # Give both threads an opportunity to run
+        eventlet.sleep(0)
+
+        # Assert that neither thread has exited
+        self.assertEqual(0, len(self.exited))
+
+        # Allow the thread to continue
+        event.send()
+
+        # Wait for both threads to complete
+        for thread in self.threads:
+            thread.wait()
+
+        # Assert that we generated the correct output only once
+        self.assertEqual([self.cache_path(func_name)], calls)
+
+    def test_func_different(self):
+        # Test that fetching multiple images proceeds concurrently
+        queue = eventlet.queue.Queue()
+        calls = []
+
+        def fake_func(path):
+            calls.append(path)
+
+            event = eventlet.event.Event()
+
+            # Let the main thread know we're done by pushing an event to the
+            # queue
+            queue.put(event)
+
+            # Wait for the main thread to tell us to proceed
+            event.wait()
+
+            # Ensure that a call to exists() now returns True for this path
+            self.paths.add(path)
+
+        # Spawn 2 threads generating different output
+        func_names = ['test1', 'test2']
+        for func_name in func_names:
+            self.spawn(self.cache.get_func_output_path, fake_func, func_name)
+
+        # Both threads should call fetch_image concurrently
+        event1 = queue.get()
+        event2 = queue.get()
+
+        # Assert that neither thread has exited
+        self.assertEqual(0, len(self.exited))
+
+        # Allow both threads to continue
+        event1.send()
+        event2.send()
+
+        # Wait for both threads to complete
+        for thread in self.threads:
+            thread.wait()
+
+        # Assert that we generated both outputs
+        expected_paths = map(lambda func_name: self.cache_path(func_name),
+                             func_names)
+        self.assertEqual(collections.Counter(expected_paths),
+                         collections.Counter(calls))

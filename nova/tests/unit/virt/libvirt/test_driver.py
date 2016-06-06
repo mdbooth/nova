@@ -9253,12 +9253,12 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def resize_image(self, size):
                     pass
 
-                def create_from_func(self, context, func, name, size,
-                                     fallback=None):
+                def create_from_func(self, context, func, cache_name,
+                                     size=None, fallback=None):
                     func_calls.append((self.path, name, size))
                     func(name)
 
-                def create_from_image(self, context, image_id, size,
+                def create_from_image(self, context, image_id, size=None,
                                       fallback=None):
                     image_calls.append((self.path, image_id, size))
 
@@ -9343,11 +9343,11 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                     self.path = os.path.join(instance['name'], name)
                     self.is_block_dev = is_block_dev
 
-                def create_from_func(self, context, func, cache_name, size,
-                                     fallback=None):
+                def create_from_func(self, context, func, cache_name,
+                                     size=None, fallback=None):
                     func_calls.append((self.path, cache_name, size))
 
-                def create_from_image(self, context, image_id, size,
+                def create_from_image(self, context, image_id, size=None,
                                       fallback=None):
                     image_calls.append((self.path, image_id, size))
 
@@ -9402,11 +9402,11 @@ class LibvirtConnTestCase(test.NoDBTestCase):
                 def resize_image(self, size):
                     pass
 
-                def create_from_func(self, context, func, cache_name, size,
-                                     fallback=None):
+                def create_from_func(self, context, func, cache_name,
+                                     size=None, fallback=None):
                     func_calls.append((self.path, cache_name, size))
 
-                def create_from_image(self, context, image_id, size,
+                def create_from_image(self, context, image_id, size=None,
                                       fallback=None):
                     image_calls.append((self.path, image_id, size))
 

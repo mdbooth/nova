@@ -3025,8 +3025,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 disk_local.check_backing_from_func(create_func, cache_name,
                                                    fallback=fallback_from_host)
             else:
-                disk_local.create_from_func(context, create_func,
-                                            cache_name,
+                disk_local.create_from_func(context, create_func, cache_name,
                                             ephemeral_gb * units.Gi,
                                             fallback=fallback_from_host)
 
@@ -3049,8 +3048,8 @@ class LibvirtDriver(driver.ComputeDriver):
                 eph_disk.check_backing_from_func(create_func, cache_name,
                                                  fallback=fallback_from_host)
             else:
-                eph_disk.create_from_func(context, create_func,
-                                          cache_name, eph['size'] * units.Gi,
+                eph_disk.create_from_func(context, create_func, cache_name,
+                                          eph['size'] * units.Gi,
                                           fallback=fallback_from_host)
 
         if 'disk.swap' in disk_mapping:
@@ -6262,7 +6261,7 @@ class LibvirtDriver(driver.ComputeDriver):
             disk = self.image_backend.image(instance, name, image_type='flat')
 
             if not disk.exists():
-                disk.create_from_image(context, image_id, 0,
+                disk.create_from_image(context, image_id,
                                        fallback=fallback_from_host)
 
     def rollback_live_migration_at_destination(self, context, instance,

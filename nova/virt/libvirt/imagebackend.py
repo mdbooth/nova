@@ -103,7 +103,8 @@ class Image(object):
         pass
 
     @abc.abstractmethod
-    def create_from_func(self, context, func, cache_name, size, fallback=None):
+    def create_from_func(self, context, func, cache_name, size=None,
+                         fallback=None):
         """Create a disk from the output of a function. Used to create
         ephemeral and swap disks.
 
@@ -112,7 +113,10 @@ class Image(object):
                to the given path.
         :cache_name: A name which can be used as a cache key for the output
                      of the given function.
-        :size: The size of the disk to create, in bytes.
+        :size: The size of the disk to create, in bytes. This is a hint for
+               efficiency. It is not used by all backends. If given, the caller
+               must ensure that this corresponds exactly to the amout of data
+               written by func().
         :fallback: A compute host to side-load the output from if it is not
                    already in the image cache.
 
@@ -120,12 +124,13 @@ class Image(object):
         pass
 
     @abc.abstractmethod
-    def create_from_image(self, context, image_id, size, fallback=None):
+    def create_from_image(self, context, image_id, size=None, fallback=None):
         """Create a disk from a glance image.
 
         :context: The current request context.
         :image_id: The image_id of the image to be fetched.
-        :size: The size of the disk to create, in bytes.
+        :size: The size of the disk to create, in bytes. If not given,
+               the disk will be created with the same size as the source image.
         :fallback: A compute host to side-load the image from if it is no
                    longer in the image cache or in glance.
 
@@ -474,12 +479,13 @@ class Flat(Image):
         if os.path.exists(self.path):
             self.driver_format = self.resolve_driver_format()
 
-    def create_from_func(self, context, func, cache_name, size, fallback=None):
+    def create_from_func(self, context, func, cache_name, size=None,
+                         fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self._create(size) as target:
             libvirt_utils.copy_image(cache_path, target)
 
-    def create_from_image(self, context, image_id, size, fallback=None):
+    def create_from_image(self, context, image_id, size=None, fallback=None):
         image_info = self._get_cached_image(context, image_id, size, fallback)
         with self._create(size) as target:
             libvirt_utils.copy_image(image_info.path, target)
@@ -542,12 +548,13 @@ class Qcow2(Image):
             return  # doesn't use a backing file or it is already cached
         return backing_path
 
-    def create_from_func(self, context, func, cache_name, size, fallback=None):
+    def create_from_func(self, context, func, cache_name, size=None,
+                         fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self._create(size) as target:
             libvirt_utils.create_cow_image(cache_path, target)
 
-    def create_from_image(self, context, image_id, size, fallback=None):
+    def create_from_image(self, context, image_id, size=None, fallback=None):
         image_info = self._get_cached_image(context, image_id, size, fallback)
         with self._create(size) as target:
             libvirt_utils.create_cow_image(image_info.path, target)
@@ -628,13 +635,14 @@ class Lvm(Image):
     def _can_fallocate(self):
         return False
 
-    def create_from_func(self, context, func, cache_name, size, fallback=None):
+    def create_from_func(self, context, func, cache_name, size=None,
+                         fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self._create(context, size) as target:
             images.convert_image_unsafe(
                 cache_path, target, self.driver_format, run_as_root=True)
 
-    def create_from_image(self, context, image_id, size, fallback=None):
+    def create_from_image(self, context, image_id, size=None, fallback=None):
         image_info = self._get_cached_image(context, image_id, size, fallback)
         with self._create(context, size) as target:
             images.convert_image(
@@ -807,12 +815,13 @@ class Rbd(Image):
             self.driver.remove_image(name)
         self.driver.import_image(local_file, name)
 
-    def create_from_func(self, context, func, cache_name, size, fallback=None):
+    def create_from_func(self, context, func, cache_name, size=None,
+                         fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self.remove_volume_on_error():
             self.driver.import_image(cache_path, self.rbd_name)
 
-    def create_from_image(self, context, image_id, size, fallback=None):
+    def create_from_image(self, context, image_id, size=None, fallback=None):
         if self._clone_from_glance_location(context, image_id, size):
             return
         image_info = self._get_cached_image(context, image_id, size, fallback)
@@ -960,12 +969,13 @@ class Ploop(Image):
         utils.execute('ploop', 'restore-descriptor', '-f', pcs_format,
                       path, image_path)
 
-    def create_from_func(self, context, func, cache_name, size, fallback=None):
+    def create_from_func(self, context, func, cache_name, size=None,
+                         fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self._create(pcs_format='raw') as target:
             libvirt_utils.copy_image(cache_path, target)
 
-    def create_from_image(self, context, image_id, size, fallback=None):
+    def create_from_image(self, context, image_id, size=None, fallback=None):
         pcs_format = self._verify_pcs_format(context, image_id)
         image_info = self._get_cached_image(context, image_id, size, fallback)
         with self._create(pcs_format) as target:

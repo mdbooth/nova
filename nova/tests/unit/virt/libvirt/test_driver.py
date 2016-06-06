@@ -41,7 +41,6 @@ from oslo_config import cfg
 from oslo_serialization import jsonutils
 from oslo_service import loopingcall
 from oslo_utils import encodeutils
-from oslo_utils import fileutils
 from oslo_utils import fixture as utils_fixture
 from oslo_utils import importutils
 from oslo_utils import units

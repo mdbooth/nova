@@ -226,16 +226,17 @@ class Image(object):
     def _get_cached_image(self, context, image_id, size, fallback):
         cache = imagecache.ImageCacheLocalDir.get()
         image_info = cache.get_image_info(context, image_id, fallback)
-        self.verify_base_size(None, size, image_info.virtual_size)
+        if size is not None:
+            self.verify_base_size(None, size, image_info.virtual_size)
         return image_info
 
     def _resize_disk(self, size, virtual_size):
         if size and size > virtual_size:
             self.resize_image(size)
 
-    def _preallocate_disk(self, size):
+    def _preallocate_disk(self):
         if self.preallocate and self._can_fallocate():
-            utils.execute('fallocate', '-n', '-l', size, self.path)
+            utils.execute('fallocate', '-n', self.path)
 
     def _can_fallocate(self):
         """Check once per class, whether fallocate(1) is available,
@@ -482,20 +483,20 @@ class Flat(Image):
     def create_from_func(self, context, func, cache_name, size=None,
                          fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
-        with self._create(size) as target:
+        with self._create() as target:
             libvirt_utils.copy_image(cache_path, target)
 
     def create_from_image(self, context, image_id, size=None, fallback=None):
         image_info = self._get_cached_image(context, image_id, size, fallback)
-        with self._create(size) as target:
+        with self._create() as target:
             libvirt_utils.copy_image(image_info.path, target)
             self._resize_disk(size, image_info.virtual_size)
 
     @contextlib.contextmanager
-    def _create(self, size):
+    def _create(self):
         with fileutils.remove_path_on_error(self.path):
             yield self.path  # /instances/instance-uuid/some-disk
-            self._preallocate_disk(size)
+            self._preallocate_disk()
             self.correct_format()
 
     def resize_image(self, size):
@@ -551,20 +552,20 @@ class Qcow2(Image):
     def create_from_func(self, context, func, cache_name, size=None,
                          fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
-        with self._create(size) as target:
+        with self._create() as target:
             libvirt_utils.create_cow_image(cache_path, target)
 
     def create_from_image(self, context, image_id, size=None, fallback=None):
         image_info = self._get_cached_image(context, image_id, size, fallback)
-        with self._create(size) as target:
+        with self._create() as target:
             libvirt_utils.create_cow_image(image_info.path, target)
             self._resize_disk(size, image_info.virtual_size)
 
     @contextlib.contextmanager
-    def _create(self, size):
+    def _create(self):
         with fileutils.remove_path_on_error(self.path):
             yield self.path  # /instances/instance-uuid/some-disk
-            self._preallocate_disk(size)
+            self._preallocate_disk()
 
     def resize_image(self, size):
         image = imgmodel.LocalFileImage(self.path, imgmodel.FORMAT_QCOW2)
@@ -637,6 +638,14 @@ class Lvm(Image):
 
     def create_from_func(self, context, func, cache_name, size=None,
                          fallback=None):
+        # NOTE(mdbooth): Nothing ever calls Lvm.create_from_func with
+        # size=None. We will update config disk creation to use
+        # create_from_func and that will pass size=None, but config disks
+        # are explicitly never created on Lvm. Consequently it is not worth
+        # implementing support for this.
+        if size is None:
+            raise NotImplementedError('Lvm.create_from_func requires size')
+
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self._create(context, size) as target:
             images.convert_image(cache_path, target,
@@ -645,6 +654,10 @@ class Lvm(Image):
 
     def create_from_image(self, context, image_id, size=None, fallback=None):
         image_info = self._get_cached_image(context, image_id, size, fallback)
+
+        if size is None:
+            size = image_info.virtual_size
+
         with self._create(context, size) as target:
             images.convert_image(
                 image_info.path, target, image_info.file_format,
@@ -823,12 +836,20 @@ class Rbd(Image):
             self.driver.import_image(cache_path, self.rbd_name)
 
     def create_from_image(self, context, image_id, size=None, fallback=None):
-        if self._clone_from_glance_location(context, image_id, size):
-            return
-        image_info = self._get_cached_image(context, image_id, size, fallback)
-        with self.remove_volume_on_error():
-            self.driver.import_image(image_info.path, self.rbd_name)
+        cloned = self._clone_from_glance_location(context, image_id, size)
+        if not cloned:
+            image_info = self._get_cached_image(context, image_id, size,
+                                                fallback)
+            if size is not None:
+                self.verify_base_size(None, size, image_info.virtual_size)
+
+            with self.remove_volume_on_error():
+                self.driver.import_image(image_info.path, self.rbd_name)
+
+        if size is not None:
             self._resize_disk(size, image_info.virtual_size)
+            # We don't resize the underlying filesystem here, which we do
+            # for other backends. This seems like a bug (but not a regression).
 
     def _clone_from_glance_location(self, context, image_id, size):
         image_meta = IMAGE_API.get(context, image_id, include_locations=True)
@@ -839,9 +860,12 @@ class Rbd(Image):
                     self.driver.clone(location, self.rbd_name)
                     # TODO(mdbooth): It would be better to verify
                     # base size before cloning the disk, but we'd
-                    # need some additional methods in rbd_utils.
-                    self.verify_base_size(self.rbd_name, size)
-                    return location
+                    # need some additional methods in rbd_utils. This isn't
+                    # too awful because clone() is fast.
+                    if size is not None:
+                        self.verify_base_size(self.rbd_name, size)
+                    return True
+        return False
 
     @contextlib.contextmanager
     def remove_volume_on_error(self):

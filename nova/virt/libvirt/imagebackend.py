@@ -639,15 +639,16 @@ class Lvm(Image):
                          fallback=None):
         cache_path = self._get_cached_output_path(func, cache_name, fallback)
         with self._create(context, size) as target:
-            images.convert_image_unsafe(
-                cache_path, target, self.driver_format, run_as_root=True)
+            images.convert_image(cache_path, target,
+                                 imgmodel.FORMAT_RAW, self.driver_format,
+                                 run_as_root=True)
 
     def create_from_image(self, context, image_id, size=None, fallback=None):
         image_info = self._get_cached_image(context, image_id, size, fallback)
         with self._create(context, size) as target:
             images.convert_image(
                 image_info.path, target, image_info.file_format,
-                self.driver_format, run_as_root=True)
+                imgmodel.FORMAT_RAW, run_as_root=True)
             self._resize_disk(size, image_info.virtual_size)
 
     @contextlib.contextmanager
